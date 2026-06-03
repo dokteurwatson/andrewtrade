@@ -350,6 +350,15 @@ class IBKRClient:
             logging.warning("Prijs ophalen mislukt voor %s: %s", ticker, exc)
             return None
 
+    @staticmethod
+    def _pick_hist_bar(bars, has_new_bar: bool):
+        """Voltooide bar: bij update [-2], bij eerste snapshot [-1]."""
+        if not bars:
+            return None
+        if has_new_bar and len(bars) >= 2:
+            return bars[-2]
+        return bars[-1]
+
     # ------------------------------------------------------------------
     # Bar streaming — historical 1m (default) of realtime 5s→1m
     # ------------------------------------------------------------------
@@ -381,6 +390,8 @@ class IBKRClient:
             "IBKR 1m historical stream (delayed OK) voor %d tickers", len(tickers)
         )
 
+        last_bar_key: Dict[str, str] = {}
+
         for ticker in tickers:
             contract = Stock(ticker, "SMART", "USD")
             qualified = await self._ib.qualifyContractsAsync(contract)
@@ -391,9 +402,17 @@ class IBKRClient:
 
             def make_handler(sym: str):
                 def handler(bars, has_new_bar):
-                    if not has_new_bar or len(bars) < 2:
+                    bar = self._pick_hist_bar(bars, has_new_bar)
+                    if bar is None:
                         return
-                    bar = bars[-2]
+                    key = str(bar.date)
+                    if last_bar_key.get(sym) == key:
+                        return
+                    last_bar_key[sym] = key
+                    logging.info(
+                        "IBKR bar %s %s H=%.4f V=%.0f (has_new_bar=%s)",
+                        sym, key, float(bar.high), float(bar.volume), has_new_bar,
+                    )
                     on_bar(
                         sym,
                         float(bar.open),
@@ -416,7 +435,14 @@ class IBKRClient:
             )
             bars.updateEvent += make_handler(ticker)
             self._bar_subs[ticker] = bars
-            logging.info("IBKR 1m historical (keepUpToDate): %s", ticker)
+            logging.info(
+                "IBKR 1m historical (keepUpToDate): %s (%d bars geladen)",
+                ticker, len(bars),
+            )
+            # Eerste load: has_new_bar=False — toch laatste bar verwerken
+            if bars:
+                h = make_handler(ticker)
+                h(bars, False)
             await asyncio.sleep(0.35)
 
     async def _subscribe_realtime_bars(
