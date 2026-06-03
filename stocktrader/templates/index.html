@@ -46,26 +46,38 @@
 <body>
 
 <h1>Stocktrader</h1>
-<p class="subtitle">{{ today }} | Krush watchlist strategie | Break + 2x Volume{% if paper_mode %} | <span class="yellow">PAPER</span>{% endif %}</p>
+<p class="subtitle">{{ today }} | Krush watchlist strategie | Break + 2x Volume{% if paper_mode %} | <span class="yellow">PAPER</span>{% else %} | <span class="green">LIVE (IBKR)</span>{% endif %}</p>
 
 {% if error %}
 <div class="error">{{ error }}</div>
 {% endif %}
+{% if warn_blocked %}
+<div class="error" style="background:#332200;color:#ffcc00;">
+  IBKR markeert deze tickers als niet verhandelbaar (OTC/MiFID): <strong>{{ warn_blocked|join(', ') }}</strong>.
+  De rest kun je wel starten. Controleer in TWS of het echt OTC is.
+</div>
+{% endif %}
 
 <!-- Status bar -->
 <div class="status-bar">
+  {% if not paper_mode %}
   <div class="stat">
-    <div class="stat-label">Status</div>
+    <div class="stat-label">IBKR</div>
+    <div class="stat-value">
+      {% if ibkr_connected %}<span class="active-dot"></span><span class="green">VERBONDEN</span>{% else %}<span class="red">NIET VERBONDEN</span>{% endif %}
+    </div>
+  </div>
+  {% endif %}
+  <div class="stat">
+    <div class="stat-label">Bot</div>
     <div class="stat-value">
       {% if state.active %}<span class="active-dot"></span><span class="green">ACTIEF</span>{% else %}<span style="color:#666">INACTIEF</span>{% endif %}
     </div>
   </div>
-  {% if paper_mode %}
   <div class="stat">
-    <div class="stat-label">Kapitaal</div>
+    <div class="stat-label">{% if paper_mode %}Kapitaal{% else %}Saldo (IBKR){% endif %}</div>
     <div class="stat-value green">${{ "%.2f"|format(state.cash) }}</div>
   </div>
-  {% endif %}
   <div class="stat">
     <div class="stat-label">Setups</div>
     <div class="stat-value">{{ setups|length }}</div>
@@ -89,16 +101,36 @@
 <div class="grid">
 
   {% if paper_mode %}
-  <!-- Kapitaal instellen -->
+  <!-- Kapitaal instellen (paper) -->
   <div class="card" style="grid-column: 1 / -1;">
     <h2>Kapitaal instellen (paper mode)</h2>
-    <form method="POST" action="/capital" style="display:flex; gap:10px; align-items:center;">
+    <form method="POST" action="/capital" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
       <input type="number" name="capital" step="0.01" min="1"
              value="{{ '%.2f'|format(state.cash) }}"
              style="background:#0d0d0d; color:#e0e0e0; border:1px solid #333; border-radius:4px; padding:8px 12px; font-family:'Courier New',monospace; font-size:0.85rem; width:160px;">
       <button type="submit" class="btn btn-green" {% if state.active %}disabled title="Stop de bot eerst"{% endif %}>Instellen</button>
-      <span style="color:#555; font-size:0.75rem;">Huidige waarde: <strong class="green">${{ '%.2f'|format(state.cash) }}</strong> | Startkapitaal env: ${{ '%.2f'|format(state.cash) }}</span>
+      <span style="color:#555; font-size:0.75rem;">Huidige waarde: <strong class="green">${{ '%.2f'|format(state.cash) }}</strong></span>
     </form>
+  </div>
+  {% else %}
+  <!-- Account saldo (live / IBKR) -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Account (IBKR)</h2>
+    <div style="display:flex; gap:32px; flex-wrap:wrap; align-items:baseline;">
+      <div>
+        <div style="color:#666; font-size:0.7rem; text-transform:uppercase;">Cash saldo</div>
+        <div style="font-size:1.8rem; font-weight:bold; color:#00ff88; margin-top:4px;">
+          ${{ "%.2f"|format(state.cash) }}
+        </div>
+      </div>
+      <div>
+        <div style="color:#666; font-size:0.7rem; text-transform:uppercase;">Gateway</div>
+        <div style="font-size:1rem; margin-top:6px;">
+          {% if ibkr_connected %}<span class="green">● Verbonden</span>{% else %}<span class="red">● Niet verbonden</span>{% endif %}
+        </div>
+      </div>
+    </div>
+    <p class="hint" style="margin-top:12px;">Saldo komt van IB Gateway en wordt elke ~30 seconden ververst. Handmatig instellen is niet nodig in live mode.</p>
   </div>
   {% endif %}
 
@@ -150,6 +182,9 @@ MASK   $3.80   $4.20   $6.75     $8.40
     </div>
     {% else %}
     <p style="color:#555; font-size:0.85rem;">Nog geen watchlist geladen voor vandaag.</p>
+    {% if not paper_mode and ibkr_connected %}
+    <p class="hint">IBKR is verbonden — plak de watchlist hierboven en klik op <strong>Parsen &amp; opslaan</strong>, daarna <strong>Start trading</strong>.</p>
+    {% endif %}
     {% endif %}
   </div>
 
@@ -207,8 +242,8 @@ MASK   $3.80   $4.20   $6.75     $8.40
 </div>
 
 <script>
-  // Auto-refresh elke 15 seconden als bot actief is
-  {% if state.active %}
+  // Auto-refresh: bot actief, of live mode met IBKR verbonden
+  {% if state.active or (not paper_mode and ibkr_connected) %}
   setTimeout(() => location.reload(), 15000);
   {% endif %}
 </script>

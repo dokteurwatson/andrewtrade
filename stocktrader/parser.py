@@ -1,14 +1,15 @@
 """
 Parser voor Krush's watchlist formaat.
 
-Ondersteunt zowel platte tekst (copy-paste uit Discord) als
+Ondersteunt zowel platte tekst (copy-paste uit Discord/Telegram) als
 gestructureerde tabel met kolommen: Stock Hold Break Target1 Target2.
 """
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 
 @dataclass
@@ -36,46 +37,80 @@ class Setup:
         return reward / risk if risk > 0 else 0
 
 
-# Patroon: ticker + 4 prijzen (met optionele $)
-_PRICE = r'\$?([\d]+\.?[\d]*)'
-_ROW   = re.compile(
-    rf'^([A-Z]{{1,6}})\s+{_PRICE}\s+{_PRICE}\s+{_PRICE}\s+{_PRICE}',
-    re.MULTILINE,
+_PRICE = r"\$?\s*([\d]{1,3}(?:[,\s][\d]{3})*(?:\.[\d]+)?|[\d]+\.?[\d]*)"
+# Ticker: 1-5 letters, optioneel .X (BRK.B); prefix bullets/stars weg in _normalize
+_TICKER = r"([A-Z]{1,5}(?:\.[A-Z])?)"
+_ROW = re.compile(
+    rf"{_TICKER}\s+{_PRICE}\s+{_PRICE}\s+{_PRICE}\s+{_PRICE}",
+    re.IGNORECASE,
 )
+
+_SKIP_WORDS = {
+    "STOCK", "HOLD", "BREAK", "TARGET", "TARGET1", "TARGET2",
+    "WATCHLIST", "SETUP", "SETUPS", "TICKER", "SYMBOL",
+}
+
+
+def _normalize_watchlist_text(text: str) -> str:
+    """Maak Telegram/Discord copy-paste parser-vriendelijk."""
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\u00a0", " ").replace("|", " ")
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)   # **HUBC** → HUBC
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # bullets: "1.", "•", "-", "▪"
+        line = re.sub(r"^[\s\*•▪\-\u2022]+", "", line)
+        line = re.sub(r"^\d+[\.\)]\s*", "", line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _parse_price(raw: str) -> float:
+    cleaned = raw.replace(",", "").replace(" ", "")
+    return float(cleaned)
+
+
+def _valid_setup(hold: float, break_: float, t1: float, t2: float) -> bool:
+    if not (hold > 0 and break_ > hold and t1 > break_):
+        return False
+    # T2 mag gelijk of hoger zijn dan T1; soms staat alleen één target dubbel
+    return t2 > 0 and t2 >= t1 * 0.99
 
 
 def parse_watchlist(text: str) -> List[Setup]:
     """
     Parst Krush's watchlist tekst naar een lijst van Setups.
 
-    Accepteert elke tekst die rijen bevat zoals:
+    Accepteert rijen zoals:
         HUBC   $0.35   $0.40   $0.50   $0.60
-        ASTC   48.00   52.00   60.00   70.00
-
-    Regels met header-woorden (Stock, Hold, Break, etc.) worden overgeslagen.
+        ASTC   48.00   52.00   60.00    70.00
+        • MEHA 0.165 0.18 0.20 0.24
     """
-    skip = {"STOCK", "HOLD", "BREAK", "TARGET", "TARGET1", "TARGET2"}
+    normalized = _normalize_watchlist_text(text)
     setups: List[Setup] = []
     seen: set[str] = set()
 
-    for match in _ROW.finditer(text):
+    for match in _ROW.finditer(normalized):
         ticker = match.group(1).upper()
-        if ticker in skip:
+        if ticker in _SKIP_WORDS:
             continue
         if ticker in seen:
-            continue  # duplicaten overslaan (zelfde ticker meerdere keren in bericht)
+            continue
         seen.add(ticker)
 
         try:
-            hold   = float(match.group(2))
-            break_ = float(match.group(3))
-            t1     = float(match.group(4))
-            t2     = float(match.group(5))
+            hold   = _parse_price(match.group(2))
+            break_ = _parse_price(match.group(3))
+            t1     = _parse_price(match.group(4))
+            t2     = _parse_price(match.group(5))
         except ValueError:
             continue
 
-        # Sanity checks
-        if not (0 < hold < break_ < t1 <= t2):
+        if not _valid_setup(hold, break_, t1, t2):
             continue
 
         setups.append(Setup(ticker=ticker, hold=hold, break_=break_, t1=t1, t2=t2))
@@ -101,7 +136,6 @@ def format_setups(setups: List[Setup]) -> str:
 
 
 if __name__ == "__main__":
-    # Test met gisteren's watchlist
     sample = """
     Stock  Hold    Break   Target 1  Target 2
     HUBC   $0.35   $0.40   $0.50     $0.60

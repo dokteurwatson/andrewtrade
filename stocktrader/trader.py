@@ -48,6 +48,7 @@ class Trader:
                 settings.ibkr_host,
                 settings.ibkr_port,
                 settings.ibkr_client_id,
+                otc_filter_enabled=settings.otc_filter_enabled,
             )
             logging.info("Live mode actief (IBKR %s:%d)", settings.ibkr_host, settings.ibkr_port)
         self.notifier  = Notifier(
@@ -124,8 +125,15 @@ class Trader:
             self.notifier.send(f"OTC-filter: {', '.join(blocked)} overgeslagen (niet verhandelbaar via IBKR)")
 
         if not tradable:
-            logging.warning("Geen verhandelbare setups na OTC-filter — trader stopt.")
-            self.notifier.send("Geen verhandelbare setups vandaag na OTC-filter.")
+            logging.warning(
+                "Geen verhandelbare setups na OTC-filter (%d geparsed, %d geblokkeerd: %s) — trader stopt.",
+                len(setups), len(blocked), blocked,
+            )
+            self.notifier.send(
+                f"Geen verhandelbare setups na OTC-filter. "
+                f"Geladen: {len(setups)} ({', '.join(s.ticker for s in setups)}). "
+                f"Geblokkeerd: {', '.join(blocked) or '—'}."
+            )
             return
 
         tickers   = [s.ticker for s in tradable]
@@ -135,7 +143,7 @@ class Trader:
         self.ibkr.subscribe_bars(tickers, self._on_bar)
         self.ibkr.start_stream()
 
-        mode = "paper" if settings.paper_mode else "LIVE"
+        mode = "paper" if self.settings.paper_mode else "LIVE"
         cash = self.ibkr.get_cash()
         msg  = (
             f"Stocktrader gestart [{mode}] | {len(setups)} setups | "

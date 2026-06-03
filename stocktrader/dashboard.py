@@ -39,13 +39,24 @@ def today() -> date:
 
 def load_state() -> DayState:
     state = store.load(today(), settings.paper_capital)
-    # In IBKR mode: haal echt saldo op
+    # In IBKR mode: haal echt saldo op (gecachet door achtergrond-thread)
     if not settings.paper_mode:
         try:
-            state.cash = trader.ibkr.get_cash()
+            cash = trader.ibkr.get_cash()
+            if cash > 0:
+                state.cash = cash
         except Exception:
             pass  # IBKR niet verbonden → fallback naar opgeslagen waarde
     return state
+
+
+def ibkr_connected() -> bool:
+    if settings.paper_mode:
+        return False
+    try:
+        return trader.ibkr.is_connected()
+    except Exception:
+        return False
 
 
 @app.route("/")
@@ -55,6 +66,7 @@ def index():
     trades    = state.get_closed_trades()
     positions = state.get_positions()
     day_pnl   = sum(t.pnl for t in trades)
+    warn_blocked = [t for t in request.args.get("warn_blocked", "").split(",") if t]
 
     return render_template(
         "index.html",
@@ -65,6 +77,8 @@ def index():
         day_pnl=day_pnl,
         today=today().isoformat(),
         paper_mode=settings.paper_mode,
+        ibkr_connected=ibkr_connected(),
+        warn_blocked=warn_blocked,
     )
 
 
@@ -78,11 +92,26 @@ def upload():
             error="Geen geldige setups gevonden. Controleer het formaat.",
             state=load_state(), setups=[], trades=[], positions={},
             day_pnl=0, today=today().isoformat(), paper_mode=settings.paper_mode,
+            ibkr_connected=ibkr_connected(), warn_blocked=[],
         )
 
     state = load_state()
     store.set_setups(state, setups)
-    logging.info("Watchlist geüpload: %d setups", len(setups))
+    logging.info("Watchlist geüpload: %d setups — %s", len(setups), ", ".join(s.ticker for s in setups))
+
+    blocked: list[str] = []
+    if not settings.paper_mode:
+        for s in setups:
+            try:
+                if not trader.ibkr.is_tradable(s.ticker):
+                    blocked.append(s.ticker)
+            except Exception:
+                blocked.append(s.ticker)
+        if blocked:
+            logging.warning("IBKR check bij upload — geblokkeerd: %s", blocked)
+
+    if blocked:
+        return redirect(url_for("index", warn_blocked=",".join(blocked)))
     return redirect(url_for("index"))
 
 
@@ -130,13 +159,14 @@ def set_capital():
 def status():
     state = load_state()
     return jsonify({
-        "date":      state.trade_date,
-        "active":    state.active,
-        "setups":    len(state.setups),
-        "positions": len(state.positions),
-        "trades":    len(state.closed_trades),
-        "day_pnl":   sum(t["pnl"] for t in state.closed_trades),
-        "cash":      state.cash,
+        "date":           state.trade_date,
+        "active":         state.active,
+        "ibkr_connected": ibkr_connected(),
+        "setups":         len(state.setups),
+        "positions":      len(state.positions),
+        "trades":         len(state.closed_trades),
+        "day_pnl":        sum(t["pnl"] for t in state.closed_trades),
+        "cash":           state.cash,
     })
 
 

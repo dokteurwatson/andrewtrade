@@ -15,6 +15,7 @@ class Settings:
     ibkr_host:      str
     ibkr_port:      int
     ibkr_client_id: int
+    otc_filter_enabled: bool  # False = alleen check of symbool op IBKR bestaat
 
     # Strategie
     volume_mult:       float  # breakout candle moet X keer het ORB gemiddelde zijn
@@ -51,6 +52,7 @@ class Settings:
             ibkr_host=os.getenv("IBKR_HOST", "ib-gateway"),
             ibkr_port=int(os.getenv("IBKR_PORT", "4002")),
             ibkr_client_id=int(os.getenv("IBKR_CLIENT_ID", "1")),
+            otc_filter_enabled=os.getenv("OTC_FILTER_ENABLED", "true").lower() == "true",
             volume_mult=float(os.getenv("VOLUME_MULT", "2.0")),
             orb_minutes=int(os.getenv("ORB_MINUTES", "0")),
             stop_loss_field=os.getenv("STOP_LOSS_FIELD", "hold"),

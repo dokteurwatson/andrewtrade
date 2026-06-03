@@ -26,10 +26,18 @@ from ib_insync import IB, MarketOrder, Stock, util
 
 
 class IBKRClient:
-    def __init__(self, host: str, port: int, client_id: int) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        client_id: int,
+        *,
+        otc_filter_enabled: bool = True,
+    ) -> None:
         self._host      = host
         self._port      = port
         self._client_id = client_id
+        self._otc_filter_enabled = otc_filter_enabled
         self._ib        = IB()
         self._bar_subs: Dict[str, object] = {}
         self._lock      = threading.Lock()
@@ -163,8 +171,60 @@ class IBKRClient:
     # OTC / MiFID II filter
     # ------------------------------------------------------------------
 
-    def is_tradable(self, ticker: str) -> bool:
+    # Exchanges die IBKR/EU meestal blokkeert (MiFID II / OTC)
+    _BLOCKED_EXCHANGES = frozenset({
+        "OTC", "OTCBB", "PINK", "GREY", "EXPERT", "IBEOS", "OTCQB", "OTCQX",
+    })
+
+    def _contract_exists(self, ticker: str) -> bool:
+        """Symbool bekend bij IBKR (geen OTC-check)."""
         contract = Stock(ticker, "SMART", "USD")
+        try:
+            qualified = self._run_in_loop(
+                self._ib.qualifyContractsAsync(contract)
+            )
+            if qualified:
+                return True
+            details = self._run_in_loop(
+                self._ib.reqContractDetailsAsync(contract)
+            )
+            return bool(details)
+        except Exception as exc:
+            logging.warning("Symbool-check mislukt voor %s: %s", ticker, exc)
+            return False
+
+    def is_tradable(self, ticker: str) -> bool:
+        """
+        True als IBKR het symbool kent en de primaire beurs geen OTC/PINK is.
+
+        Let op: validExchanges bevat vaak ook 'OTC' als route — die negeren we.
+        Alleen primaryExch telt (NYSE, NASDAQ, ISLAND, leeg, etc.).
+        """
+        if not self._otc_filter_enabled:
+            return self._contract_exists(ticker)
+
+        contract = Stock(ticker, "SMART", "USD")
+        try:
+            qualified = self._run_in_loop(
+                self._ib.qualifyContractsAsync(contract)
+            )
+        except Exception as exc:
+            logging.warning("qualify mislukt voor %s: %s", ticker, exc)
+            qualified = []
+
+        if qualified:
+            c = qualified[0]
+            primary = (c.primaryExch or "").upper()
+            if primary in self._BLOCKED_EXCHANGES:
+                logging.info(
+                    "OTC-filter: %s geblokkeerd (primaryExch=%s)", ticker, primary
+                )
+                return False
+            logging.info(
+                "OTC-filter: %s OK (primaryExch=%s)", ticker, primary or "SMART"
+            )
+            return True
+
         try:
             details = self._run_in_loop(
                 self._ib.reqContractDetailsAsync(contract)
@@ -177,16 +237,25 @@ class IBKRClient:
             logging.info("OTC-filter: %s niet gevonden op IBKR → overgeslagen.", ticker)
             return False
 
-        primary = (details[0].contract.primaryExch or "").upper()
-        allowed = {"NYSE", "NASDAQ", "ARCA", "BATS", "IEX"}
-        if primary not in allowed:
+        primaries: list[str] = []
+        for d in details:
+            c = d.contract
+            if c.secType != "STK" or c.currency != "USD":
+                continue
+            primary = (c.primaryExch or "").upper()
+            primaries.append(primary or "—")
+            if primary in self._BLOCKED_EXCHANGES:
+                continue
             logging.info(
-                "OTC-filter: %s primaryExch=%s → overgeslagen (MiFID II).",
-                ticker, primary,
+                "OTC-filter: %s OK (primaryExch=%s)", ticker, primary or "—"
             )
-            return False
+            return True
 
-        return True
+        logging.info(
+            "OTC-filter: %s → overgeslagen (alleen OTC: %s)",
+            ticker, ", ".join(dict.fromkeys(primaries)) or "?",
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Orders
