@@ -1,13 +1,12 @@
 """
-Sluit alle open US-aandelenposities — paper/liquidatie, verlies OK.
+Sluit alle open US-aandelenposities — paper/liquidatie.
 
-- Vaste chunks (default 500 stuks, restant <500 in één order)
-- LIMIT DAY, ruim onder markt (paper weg = prioriteit)
-- usePriceMgmtAlgo=False (minder IB 2161)
-- Bij geen fill: cancel → dieper discount → zelfde chunk opnieuw
+- Chunks van 500 (default)
+- LIMIT DAY dicht bij markt (IB weigert >~10% onder ref, Warning 202)
+- Bij reject: prijs omhoog (dichter bij markt), niet verder omlaag
+- usePriceMgmtAlgo=False
 
   python -m stocktrader.close_all_ibkr --yes --chunk 500 --timeout 120
-  python -m stocktrader.close_all_ibkr --yes --symbol SOAR
 """
 from __future__ import annotations
 
@@ -16,9 +15,12 @@ import asyncio
 import logging
 import math
 import os
+import re
 import sys
 
 from ib_insync import IB, LimitOrder, util
+
+from stocktrader.config import Settings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,17 +30,17 @@ log = logging.getLogger("close_all_ibkr")
 
 TERMINAL_BAD = frozenset({"CANCELLED", "INACTIVE", "APICANCELLED"})
 WORKING = frozenset({"SUBMITTED", "PRESUBMITTED", "PENDINGSUBMIT", "PENDINGCANCEL", ""})
-# Start 15% onder markt; +10% extra korting per mislukte poging (max ~65%)
-BASE_DISCOUNT = 0.15
-DISCOUNT_STEP = 0.10
-MAX_DISCOUNT = 0.65
+# SELL: start 2% onder ref; bij IB 202 stap naar bid/markt (max ~0% korting)
+SELL_DISCOUNTS = (0.02, 0.01, 0.005, 0.0)
 
 
 def _apply_market_data_type(ib: IB) -> None:
+    raw = os.getenv("IBKR_MARKET_DATA_TYPE", "delayed")
+    mdt = Settings._parse_market_data_type(raw)
+    labels = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}
     try:
-        mdt = int(os.getenv("IBKR_MARKET_DATA_TYPE", "1"))
         ib.reqMarketDataType(mdt)
-        log.info("Market data type=%s", mdt)
+        log.info("Market data type=%s (%s)", mdt, labels.get(mdt, raw))
     except Exception as e:
         log.warning("reqMarketDataType mislukt: %s", e)
 
@@ -71,12 +73,40 @@ def _chunk_qty(remaining: int, chunk_size: int) -> int:
     return min(remaining, chunk_size) if chunk_size > 0 else remaining
 
 
-def _aggressive_price(side: str, ref: float, attempt: int) -> float:
-    """SELL ruim onder markt; BUY erboven — paper weg heeft prioriteit."""
-    disc = min(MAX_DISCOUNT, BASE_DISCOUNT + DISCOUNT_STEP * attempt)
+def _trade_log_text(trade) -> str:
+    return " ".join(str(e) for e in (trade.log or []))
+
+
+def _parse_ib_price_cap(text: str) -> tuple[float | None, float | None]:
+    """IB Warning 202: min SELL limit + optionele marktprijs uit melding."""
+    floor = None
+    market = None
+    m = re.search(r"more aggressive than ([\d.]+)", text, re.I)
+    if m:
+        floor = float(m.group(1))
+    m = re.search(r"market price of ([\d.]+)", text, re.I)
+    if m:
+        market = float(m.group(1))
+    return floor, market
+
+
+def _limit_price(
+    side: str,
+    ref: float,
+    attempt: int,
+    *,
+    ib_floor: float | None,
+) -> float:
+    """SELL: niet onder IB-floor; bij reject attempt omhoog = dichter bij markt."""
     if side == "SELL":
-        return _round_price(ref * (1.0 - disc))
-    return _round_price(ref * (1.0 + disc))
+        disc = SELL_DISCOUNTS[min(attempt, len(SELL_DISCOUNTS) - 1)]
+        price = ref * (1.0 - disc)
+        if ib_floor and ib_floor > 0:
+            price = max(price, ib_floor)
+        return _round_price(price)
+    disc = SELL_DISCOUNTS[min(attempt, len(SELL_DISCOUNTS) - 1)]
+    price = ref * (1.0 + disc)
+    return _round_price(price)
 
 
 async def _snapshot_price(ib: IB, contract, side: str) -> float | None:
@@ -94,12 +124,12 @@ async def _snapshot_price(ib: IB, contract, side: str) -> float | None:
 
 
 async def _reference_price(ib: IB, contract, side: str) -> float:
-    px = _portfolio_price(ib, contract)
-    if px and px > 0:
-        return px
     snap = await _snapshot_price(ib, contract, side)
     if snap and snap > 0:
         return snap
+    px = _portfolio_price(ib, contract)
+    if px and px > 0:
+        return px
     raise RuntimeError(f"geen marktprijs voor {contract.symbol}")
 
 
@@ -117,7 +147,7 @@ async def _wait_done(trade, label: str, timeout_sec: float) -> float:
         if st in TERMINAL_BAD:
             if filled > 0:
                 return filled
-            raise RuntimeError(f"{label} {st}")
+            raise RuntimeError(f"{label} {st}: {_trade_log_text(trade)}")
         await asyncio.sleep(0.25)
     filled = float(trade.orderStatus.filled or 0)
     if filled > 0:
@@ -147,21 +177,24 @@ async def _sell_chunk(
     *,
     timeout_sec: float,
     attempt: int,
+    ib_floor: float | None,
 ) -> float:
     ref = await _reference_price(ib, contract, side)
-    price = _aggressive_price(side, ref, attempt)
-    disc_pct = min(MAX_DISCOUNT, BASE_DISCOUNT + DISCOUNT_STEP * attempt) * 100
+    price = _limit_price(side, ref, attempt, ib_floor=ib_floor)
     order = LimitOrder(side, qty, price, tif="DAY")
     order.usePriceMgmtAlgo = False
     log.info(
-        "%s LIMIT DAY %s x%d @ %s (ref %.4f, ~%.0f%% agressief)",
-        label, side, qty, price, ref, disc_pct,
+        "%s LIMIT DAY %s x%d @ %s (ref %.4f, floor %s, poging %d)",
+        label, side, qty, price, ref, ib_floor, attempt,
     )
     trade = ib.placeOrder(contract, order)
-    filled = await _wait_done(trade, label, timeout_sec)
+    try:
+        filled = await _wait_done(trade, label, timeout_sec)
+    except RuntimeError:
+        raise
     if filled <= 0:
         await _cancel_trade(ib, trade)
-        raise RuntimeError(f"{label} 0 fill @ {price}")
+        raise RuntimeError(f"{label} 0 fill @ {price}: {_trade_log_text(trade)}")
     return filled
 
 
@@ -176,6 +209,7 @@ async def _close_symbol(
     side = "SELL"
     chunk_no = 0
     attempt = 0
+    ib_floor: float | None = None
 
     while True:
         open_pos = await _refresh_positions(ib)
@@ -199,13 +233,28 @@ async def _close_symbol(
         try:
             filled = await _sell_chunk(
                 ib, contract, side, qty, label,
-                timeout_sec=order_timeout_sec, attempt=attempt,
+                timeout_sec=order_timeout_sec,
+                attempt=attempt,
+                ib_floor=ib_floor,
             )
             log.info("%s → filled %s", label, filled)
             attempt = 0
+            ib_floor = None
         except RuntimeError as e:
-            log.warning("%s: %s — zwaardere korting", sym, e)
-            attempt = min(attempt + 1, 5)
+            err = str(e)
+            cap_floor, cap_mkt = _parse_ib_price_cap(err)
+            if cap_floor:
+                ib_floor = cap_floor
+                log.warning(
+                    "%s: IB min limit %.4f (markt %.4f) — prijs omhoog",
+                    sym,
+                    cap_floor,
+                    cap_mkt or 0,
+                )
+                attempt = 0
+            else:
+                log.warning("%s: %s — dichter bij markt", sym, e)
+                attempt = min(attempt + 1, len(SELL_DISCOUNTS) - 1)
             await asyncio.sleep(2)
 
         await asyncio.sleep(0.2)
@@ -225,6 +274,7 @@ async def run(
         chunk_size = int(os.getenv("MAX_ORDER_SHARES", "500"))
 
     util.logToFile(f"close_all_ibkr_client_{client_id}.log")
+    util.logToConsole(logging.WARNING)
     ib = IB()
     log.info("Verbinden %s:%d clientId=%d chunk=%d ...", host, port, client_id, chunk_size)
     try:
@@ -245,13 +295,14 @@ async def run(
         ib.disconnect()
         return 0
 
-    log.info("Modus: agressief LIMIT DAY, chunks=%d, timeout=%.0fs", chunk_size, order_timeout_sec)
+    log.info("Modus: LIMIT DAY bij markt, chunks=%d, timeout=%.0fs", chunk_size, order_timeout_sec)
     for p in open_pos:
         rem = abs(int(p.position))
         n = math.ceil(rem / chunk_size) if chunk_size else 1
         log.info("  %s qty=%s → ~%d orders x%d", p.contract.symbol, p.position, n, chunk_size)
 
     if dry_run:
+        log.info("Dry-run klaar — geen orders geplaatst.")
         ib.disconnect()
         return 0
 
