@@ -184,6 +184,7 @@ class Trader:
         low: float,
         close: float,
         volume: float,
+        is_new_bar: bool = True,
     ) -> None:
         with self._lock:
             if self._state is None:
@@ -199,8 +200,9 @@ class Trader:
             bar_num = self._bar_count[ticker]
 
             logging.debug(
-                "BAR #%d %s  O=%.4f H=%.4f L=%.4f C=%.4f V=%.0f",
+                "BAR #%d %s  O=%.4f H=%.4f L=%.4f C=%.4f V=%.0f%s",
                 bar_num, ticker, open_, high, low, close, volume,
+                "" if is_new_bar else " (snapshot)",
             )
 
             # ORB window opbouwen
@@ -219,6 +221,10 @@ class Trader:
             )
 
             positions = state.get_positions()
+
+            # Snapshot bij subscribe: geen entry/exit (voorkomt valse breakout op oude bar)
+            if not is_new_bar:
+                return
 
             # --- EXIT: stop of target ---
             if ticker in positions:
@@ -311,11 +317,20 @@ class Trader:
                 logging.warning("Na herberekening onvoldoende cash voor %s.", setup.ticker)
                 return
 
+        logging.info(
+            "ENTRY order %s x%d @~%.4f [%s] portfolio=%.0f cash=%.0f",
+            setup.ticker, shares, size_price, mode, portfolio, cash,
+        )
         try:
             order_id = self.ibkr.buy_market(setup.ticker, shares)
         except Exception as exc:
-            logging.error("Order mislukt voor %s: %s", setup.ticker, exc)
-            self.notifier.send(f"ORDER MISLUKT {setup.ticker}: {exc}")
+            detail = str(exc).strip() or repr(exc)
+            logging.error(
+                "Order mislukt voor %s x%d: %s", setup.ticker, shares, detail,
+            )
+            self.notifier.send(
+                f"ORDER MISLUKT {setup.ticker} x{shares}: {detail}"
+            )
             return
 
         pos = Position(

@@ -17,6 +17,7 @@ Architectuur:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
@@ -50,6 +51,10 @@ class IBKRClient:
         self._loop_ready = threading.Event()
         self._cached_cash: float = 0.0
         util.logToConsole(logging.WARNING)
+        # ib_insync bar handlers draaien op de event-loop; strategie niet synchroon daar
+        self._bar_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ibkr-bar-dispatch",
+        )
 
         # Start de vaste event-loop thread meteen
         self._loop_thread = threading.Thread(
@@ -136,7 +141,13 @@ class IBKRClient:
         if self._loop is None:
             raise RuntimeError("IBKR event loop niet beschikbaar")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"IBKR event loop timeout na {timeout:.0f}s "
+                f"(loop mogelijk overbelast door bar-streams)"
+            ) from exc
 
     def _apply_market_data_type(self) -> None:
         """1=live, 3=delayed (~15min, vaak zonder betaald NASDAQ/AMEX RT pakket)."""
@@ -289,17 +300,44 @@ class IBKRClient:
     # Orders
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _order_error_detail(trade) -> str:
+        """IBKR reject/cancel reden uit trade.log en orderStatus."""
+        status = getattr(trade.orderStatus, "status", "") or ""
+        why = getattr(trade.orderStatus, "whyHeld", "") or ""
+        parts = [p for p in (status, why) if p]
+        for entry in reversed(trade.log or []):
+            msg = getattr(entry, "message", None) or str(entry)
+            if msg and msg not in parts:
+                parts.append(msg)
+        return " | ".join(parts) if parts else "geen status van IBKR (check Gateway logs)"
+
     def buy_market(self, ticker: str, shares: int) -> str:
         contract = Stock(ticker, "SMART", "USD")
 
         async def _place():
-            await self._ib.qualifyContractsAsync(contract)
+            qualified = await self._ib.qualifyContractsAsync(contract)
+            if not qualified:
+                raise RuntimeError(f"contract niet gekwalificeerd: {ticker}")
+            c = qualified[0]
             order = MarketOrder("BUY", shares)
-            trade = self._ib.placeOrder(contract, order)
-            await asyncio.sleep(1)
+            trade = self._ib.placeOrder(c, order)
+            for _ in range(25):
+                st = (trade.orderStatus.status or "").upper()
+                if st == "FILLED":
+                    break
+                if st in ("CANCELLED", "INACTIVE", "APICANCELLED"):
+                    raise RuntimeError(self._order_error_detail(trade))
+                await asyncio.sleep(0.2)
+            else:
+                st = (trade.orderStatus.status or "").upper()
+                if st != "FILLED":
+                    raise RuntimeError(
+                        f"order timeout status={st}: {self._order_error_detail(trade)}"
+                    )
             return str(trade.order.orderId)
 
-        order_id = self._run_in_loop(_place())
+        order_id = self._run_in_loop(_place(), timeout=60)
         logging.info("BUY %s x%d  order_id=%s", ticker, shares, order_id)
         return order_id
 
@@ -307,13 +345,28 @@ class IBKRClient:
         contract = Stock(ticker, "SMART", "USD")
 
         async def _place():
-            await self._ib.qualifyContractsAsync(contract)
+            qualified = await self._ib.qualifyContractsAsync(contract)
+            if not qualified:
+                raise RuntimeError(f"contract niet gekwalificeerd: {ticker}")
+            c = qualified[0]
             order = MarketOrder("SELL", shares)
-            trade = self._ib.placeOrder(contract, order)
-            await asyncio.sleep(1)
+            trade = self._ib.placeOrder(c, order)
+            for _ in range(25):
+                st = (trade.orderStatus.status or "").upper()
+                if st == "FILLED":
+                    break
+                if st in ("CANCELLED", "INACTIVE", "APICANCELLED"):
+                    raise RuntimeError(self._order_error_detail(trade))
+                await asyncio.sleep(0.2)
+            else:
+                st = (trade.orderStatus.status or "").upper()
+                if st != "FILLED":
+                    raise RuntimeError(
+                        f"order timeout status={st}: {self._order_error_detail(trade)}"
+                    )
             return str(trade.order.orderId)
 
-        order_id = self._run_in_loop(_place())
+        order_id = self._run_in_loop(_place(), timeout=60)
         logging.info("SELL %s x%d  order_id=%s", ticker, shares, order_id)
         return order_id
 
@@ -347,8 +400,46 @@ class IBKRClient:
         try:
             return self._run_in_loop(_fetch())
         except Exception as exc:
-            logging.warning("Prijs ophalen mislukt voor %s: %s", ticker, exc)
+            detail = str(exc).strip() or repr(exc)
+            logging.warning("Prijs ophalen mislukt voor %s: %s", ticker, detail)
             return None
+
+    def _dispatch_bar(
+        self,
+        on_bar: Callable[..., None],
+        ticker: str,
+        open_: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: float,
+        *,
+        is_new_bar: bool,
+    ) -> None:
+        """Strategie op worker-thread — voorkomt deadlock met _run_in_loop."""
+        self._bar_executor.submit(
+            self._run_bar_callback,
+            on_bar, ticker, open_, high, low, close, volume, is_new_bar,
+        )
+
+    @staticmethod
+    def _run_bar_callback(
+        on_bar: Callable[..., None],
+        ticker: str,
+        open_: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: float,
+        is_new_bar: bool,
+    ) -> None:
+        try:
+            on_bar(ticker, open_, high, low, close, volume, is_new_bar)
+        except Exception as exc:
+            logging.error(
+                "Bar callback fout %s: %s", ticker, str(exc).strip() or repr(exc),
+                exc_info=True,
+            )
 
     @staticmethod
     def _pick_hist_bar(bars, has_new_bar: bool):
@@ -413,13 +504,15 @@ class IBKRClient:
                         "IBKR bar %s %s H=%.4f V=%.0f (has_new_bar=%s)",
                         sym, key, float(bar.high), float(bar.volume), has_new_bar,
                     )
-                    on_bar(
+                    self._dispatch_bar(
+                        on_bar,
                         sym,
                         float(bar.open),
                         float(bar.high),
                         float(bar.low),
                         float(bar.close),
                         float(bar.volume),
+                        is_new_bar=has_new_bar,
                     )
                 return handler
 
@@ -439,10 +532,26 @@ class IBKRClient:
                 "IBKR 1m historical (keepUpToDate): %s (%d bars geladen)",
                 ticker, len(bars),
             )
-            # Eerste load: has_new_bar=False — toch laatste bar verwerken
+            # Eerste load: snapshot voor logging/ORB; geen entry (is_new_bar=False)
             if bars:
-                h = make_handler(ticker)
-                h(bars, False)
+                bar = self._pick_hist_bar(bars, False)
+                if bar is not None:
+                    key = str(bar.date)
+                    last_bar_key[ticker] = key
+                    logging.info(
+                        "IBKR bar %s %s H=%.4f V=%.0f (snapshot)",
+                        ticker, key, float(bar.high), float(bar.volume),
+                    )
+                    self._dispatch_bar(
+                        on_bar,
+                        ticker,
+                        float(bar.open),
+                        float(bar.high),
+                        float(bar.low),
+                        float(bar.close),
+                        float(bar.volume),
+                        is_new_bar=False,
+                    )
             await asyncio.sleep(0.35)
 
     async def _subscribe_realtime_bars(
@@ -477,13 +586,15 @@ class IBKRClient:
                     accumulator["count"]  += 1
 
                     if accumulator["count"] >= 12:
-                        on_bar(
+                        self._dispatch_bar(
+                            on_bar,
                             sym,
                             accumulator["open"],
                             accumulator["high"],
                             accumulator["low"],
                             accumulator["close"],
                             accumulator["volume"],
+                            is_new_bar=True,
                         )
                         accumulator.update({
                             "open": None, "high": -1e9, "low": 1e9,
