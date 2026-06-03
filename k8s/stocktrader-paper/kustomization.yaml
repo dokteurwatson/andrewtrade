@@ -13,4 +13,4 @@ resources:
 
 images:
   - name: registry.dizzyman.nl/stocktrader
-    newTag: 1.0.1
+    newTag: "1.1.6"
