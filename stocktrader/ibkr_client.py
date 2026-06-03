@@ -176,6 +176,14 @@ class IBKRClient:
         "OTC", "OTCBB", "PINK", "GREY", "EXPERT", "IBEOS", "OTCQB", "OTCQX",
     })
 
+    @staticmethod
+    def _primary_exchange(contract) -> str:
+        """ib_insync: attribuut heet primaryExchange (niet primaryExch)."""
+        val = getattr(contract, "primaryExchange", None) or getattr(
+            contract, "primaryExch", None
+        )
+        return (val or "").upper()
+
     def _contract_exists(self, ticker: str) -> bool:
         """Symbool bekend bij IBKR (geen OTC-check)."""
         contract = Stock(ticker, "SMART", "USD")
@@ -198,7 +206,7 @@ class IBKRClient:
         True als IBKR het symbool kent en de primaire beurs geen OTC/PINK is.
 
         Let op: validExchanges bevat vaak ook 'OTC' als route — die negeren we.
-        Alleen primaryExch telt (NYSE, NASDAQ, ISLAND, leeg, etc.).
+        Alleen primaryExchange telt (NYSE, NASDAQ, ISLAND, leeg, etc.).
         """
         if not self._otc_filter_enabled:
             return self._contract_exists(ticker)
@@ -214,14 +222,14 @@ class IBKRClient:
 
         if qualified:
             c = qualified[0]
-            primary = (c.primaryExch or "").upper()
+            primary = self._primary_exchange(c)
             if primary in self._BLOCKED_EXCHANGES:
                 logging.info(
-                    "OTC-filter: %s geblokkeerd (primaryExch=%s)", ticker, primary
+                    "OTC-filter: %s geblokkeerd (primaryExchange=%s)", ticker, primary
                 )
                 return False
             logging.info(
-                "OTC-filter: %s OK (primaryExch=%s)", ticker, primary or "SMART"
+                "OTC-filter: %s OK (primaryExchange=%s)", ticker, primary or "SMART"
             )
             return True
 
@@ -242,12 +250,12 @@ class IBKRClient:
             c = d.contract
             if c.secType != "STK" or c.currency != "USD":
                 continue
-            primary = (c.primaryExch or "").upper()
+            primary = self._primary_exchange(c)
             primaries.append(primary or "—")
             if primary in self._BLOCKED_EXCHANGES:
                 continue
             logging.info(
-                "OTC-filter: %s OK (primaryExch=%s)", ticker, primary or "—"
+                "OTC-filter: %s OK (primaryExchange=%s)", ticker, primary or "—"
             )
             return True
 

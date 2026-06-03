@@ -115,7 +115,12 @@ class Trader:
         tradable = []
         blocked  = []
         for s in setups:
-            if self.ibkr.is_tradable(s.ticker):
+            try:
+                ok = self.ibkr.is_tradable(s.ticker)
+            except Exception as exc:
+                logging.warning("Tradable-check mislukt voor %s: %s", s.ticker, exc)
+                ok = False
+            if ok:
                 tradable.append(s)
             else:
                 blocked.append(s.ticker)
