@@ -33,13 +33,18 @@ class IBKRClient:
         client_id: int,
         *,
         otc_filter_enabled: bool = True,
+        market_data_type: int = 3,
+        bar_stream_mode: str = "historical",
     ) -> None:
         self._host      = host
         self._port      = port
         self._client_id = client_id
         self._otc_filter_enabled = otc_filter_enabled
+        self._market_data_type = market_data_type
+        self._bar_stream_mode = bar_stream_mode.lower()
         self._ib        = IB()
         self._bar_subs: Dict[str, object] = {}
+        self._mdt_applied = False
         self._lock      = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
@@ -77,6 +82,7 @@ class IBKRClient:
                             self._host, self._port, clientId=self._client_id
                         )
                         logging.info("IBKR verbonden.")
+                        self._apply_market_data_type()
                         # Wacht tot IB Gateway account-data heeft gestuurd
                         await asyncio.sleep(3)
 
@@ -125,12 +131,26 @@ class IBKRClient:
 
         loop.run_until_complete(_main())
 
-    def _run_in_loop(self, coro):
+    def _run_in_loop(self, coro, timeout: float = 30):
         """Voer een coroutine uit vanuit een andere thread en wacht op het resultaat."""
         if self._loop is None:
             raise RuntimeError("IBKR event loop niet beschikbaar")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=30)
+        return future.result(timeout=timeout)
+
+    def _apply_market_data_type(self) -> None:
+        """1=live, 3=delayed (~15min, vaak zonder betaald NASDAQ/AMEX RT pakket)."""
+        labels = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}
+        try:
+            self._ib.reqMarketDataType(self._market_data_type)
+            self._mdt_applied = True
+            logging.info(
+                "IBKR market data type: %s (%d)",
+                labels.get(self._market_data_type, "?"),
+                self._market_data_type,
+            )
+        except Exception as exc:
+            logging.warning("reqMarketDataType mislukt: %s", exc)
 
     # ------------------------------------------------------------------
     # Verbinding (publiek)
@@ -316,6 +336,7 @@ class IBKRClient:
         contract = Stock(ticker, "SMART", "USD")
 
         async def _fetch():
+            self._apply_market_data_type()
             await self._ib.qualifyContractsAsync(contract)
             td = self._ib.reqMktData(contract, "", True, False)
             await asyncio.sleep(2)
@@ -330,7 +351,7 @@ class IBKRClient:
             return None
 
     # ------------------------------------------------------------------
-    # Real-time streaming (5-seconde bars → aggregeren naar 1m)
+    # Bar streaming — historical 1m (default) of realtime 5s→1m
     # ------------------------------------------------------------------
 
     def subscribe_bars(
@@ -338,50 +359,117 @@ class IBKRClient:
         tickers: List[str],
         on_bar: Callable[[str, float, float, float, float, float], None],
     ) -> None:
-        async def _subscribe():
-            for ticker in tickers:
-                contract = Stock(ticker, "SMART", "USD")
-                await self._ib.qualifyContractsAsync(contract)
+        if self._bar_stream_mode == "realtime":
+            self._run_in_loop(
+                self._subscribe_realtime_bars(tickers, on_bar),
+                timeout=max(60, len(tickers) * 5),
+            )
+        else:
+            self._run_in_loop(
+                self._subscribe_historical_bars(tickers, on_bar),
+                timeout=max(120, len(tickers) * 10),
+            )
 
-                acc: Dict = {
-                    "open": None, "high": -1e9, "low": 1e9,
-                    "close": None, "volume": 0.0, "count": 0,
-                }
+    async def _subscribe_historical_bars(
+        self,
+        tickers: List[str],
+        on_bar: Callable[[str, float, float, float, float, float], None],
+    ) -> None:
+        """1-min bars via keepUpToDate — werkt met delayed data (geen Error 420)."""
+        self._apply_market_data_type()
+        logging.info(
+            "IBKR 1m historical stream (delayed OK) voor %d tickers", len(tickers)
+        )
 
-                def make_handler(sym: str, accumulator: Dict):
-                    def handler(bars, has_new_bar):
-                        if not bars:
-                            return
-                        bar = bars[-1]
-                        if accumulator["open"] is None:
-                            accumulator["open"] = bar.open_
-                        accumulator["high"]   = max(accumulator["high"],  bar.high)
-                        accumulator["low"]    = min(accumulator["low"],   bar.low)
-                        accumulator["close"]  = bar.close
-                        accumulator["volume"] += bar.volume
-                        accumulator["count"]  += 1
+        for ticker in tickers:
+            contract = Stock(ticker, "SMART", "USD")
+            qualified = await self._ib.qualifyContractsAsync(contract)
+            if not qualified:
+                logging.warning("IBKR historical: %s niet gekwalificeerd", ticker)
+                continue
+            contract = qualified[0]
 
-                        if accumulator["count"] >= 12:
-                            on_bar(
-                                sym,
-                                accumulator["open"],
-                                accumulator["high"],
-                                accumulator["low"],
-                                accumulator["close"],
-                                accumulator["volume"],
-                            )
-                            accumulator.update({
-                                "open": None, "high": -1e9, "low": 1e9,
-                                "close": None, "volume": 0.0, "count": 0,
-                            })
-                    return handler
+            def make_handler(sym: str):
+                def handler(bars, has_new_bar):
+                    if not has_new_bar or len(bars) < 2:
+                        return
+                    bar = bars[-2]
+                    on_bar(
+                        sym,
+                        float(bar.open),
+                        float(bar.high),
+                        float(bar.low),
+                        float(bar.close),
+                        float(bar.volume),
+                    )
+                return handler
 
-                bars = self._ib.reqRealTimeBars(contract, 5, "TRADES", False)
-                bars.updateEvent += make_handler(ticker, acc)
-                self._bar_subs[ticker] = bars
-                logging.info("IBKR real-time bars: %s", ticker)
+            bars = await self._ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime="",
+                durationStr="1 D",
+                barSizeSetting="1 min",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+                keepUpToDate=True,
+            )
+            bars.updateEvent += make_handler(ticker)
+            self._bar_subs[ticker] = bars
+            logging.info("IBKR 1m historical (keepUpToDate): %s", ticker)
+            await asyncio.sleep(0.35)
 
-        self._run_in_loop(_subscribe())
+    async def _subscribe_realtime_bars(
+        self,
+        tickers: List[str],
+        on_bar: Callable[[str, float, float, float, float, float], None],
+    ) -> None:
+        """5s real-time bars — vereist betaald US equity RT market data abonnement."""
+        self._apply_market_data_type()
+        logging.info("IBKR 5s realtime bars voor %d tickers", len(tickers))
+
+        for ticker in tickers:
+            contract = Stock(ticker, "SMART", "USD")
+            await self._ib.qualifyContractsAsync(contract)
+
+            acc: Dict = {
+                "open": None, "high": -1e9, "low": 1e9,
+                "close": None, "volume": 0.0, "count": 0,
+            }
+
+            def make_handler(sym: str, accumulator: Dict):
+                def handler(bars, has_new_bar):
+                    if not bars:
+                        return
+                    bar = bars[-1]
+                    if accumulator["open"] is None:
+                        accumulator["open"] = bar.open_
+                    accumulator["high"]   = max(accumulator["high"],  bar.high)
+                    accumulator["low"]    = min(accumulator["low"],   bar.low)
+                    accumulator["close"]  = bar.close
+                    accumulator["volume"] += bar.volume
+                    accumulator["count"]  += 1
+
+                    if accumulator["count"] >= 12:
+                        on_bar(
+                            sym,
+                            accumulator["open"],
+                            accumulator["high"],
+                            accumulator["low"],
+                            accumulator["close"],
+                            accumulator["volume"],
+                        )
+                        accumulator.update({
+                            "open": None, "high": -1e9, "low": 1e9,
+                            "close": None, "volume": 0.0, "count": 0,
+                        })
+                return handler
+
+            rt = self._ib.reqRealTimeBars(contract, 5, "TRADES", False)
+            rt.updateEvent += make_handler(ticker, acc)
+            self._bar_subs[ticker] = rt
+            logging.info("IBKR real-time bars: %s", ticker)
+            await asyncio.sleep(0.2)
 
     def start_stream(self) -> None:
         """Event loop draait al — geen aparte thread nodig."""
@@ -389,11 +477,15 @@ class IBKRClient:
 
     def stop_stream(self) -> None:
         async def _stop():
-            for bars in self._bar_subs.values():
+            for sym, bars in list(self._bar_subs.items()):
                 try:
-                    self._ib.cancelRealTimeBars(bars)
+                    if self._bar_stream_mode == "realtime":
+                        self._ib.cancelRealTimeBars(bars)
+                    else:
+                        self._ib.cancelHistoricalData(bars)
                 except Exception:
                     pass
+            self._bar_subs.clear()
 
         try:
             self._run_in_loop(_stop())

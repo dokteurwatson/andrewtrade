@@ -49,6 +49,8 @@ class Trader:
                 settings.ibkr_port,
                 settings.ibkr_client_id,
                 otc_filter_enabled=settings.otc_filter_enabled,
+                market_data_type=settings.ibkr_market_data_type,
+                bar_stream_mode=settings.ibkr_bar_stream,
             )
             logging.info("Live mode actief (IBKR %s:%d)", settings.ibkr_host, settings.ibkr_port)
         self.notifier  = Notifier(

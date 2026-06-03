@@ -16,6 +16,8 @@ class Settings:
     ibkr_port:      int
     ibkr_client_id: int
     otc_filter_enabled: bool  # False = alleen check of symbool op IBKR bestaat
+    ibkr_market_data_type: int   # 1=live 2=frozen 3=delayed 4=delayed_frozen
+    ibkr_bar_stream: str         # historical (default) | realtime
 
     # Strategie
     volume_mult:       float  # breakout candle moet X keer het ORB gemiddelde zijn
@@ -43,6 +45,17 @@ class Settings:
     log_level:         str
 
     @staticmethod
+    def _parse_market_data_type(raw: str) -> int:
+        key = raw.strip().lower()
+        mapping = {"live": 1, "frozen": 2, "delayed": 3, "delayed_frozen": 4}
+        if key in mapping:
+            return mapping[key]
+        try:
+            return int(key)
+        except ValueError:
+            return 3
+
+    @staticmethod
     def from_env() -> "Settings":
         return Settings(
             paper_mode=os.getenv("PAPER_MODE", "true").lower() == "true",
@@ -53,6 +66,10 @@ class Settings:
             ibkr_port=int(os.getenv("IBKR_PORT", "4002")),
             ibkr_client_id=int(os.getenv("IBKR_CLIENT_ID", "1")),
             otc_filter_enabled=os.getenv("OTC_FILTER_ENABLED", "true").lower() == "true",
+            ibkr_market_data_type=Settings._parse_market_data_type(
+                os.getenv("IBKR_MARKET_DATA_TYPE", "delayed")
+            ),
+            ibkr_bar_stream=os.getenv("IBKR_BAR_STREAM", "historical").lower(),
             volume_mult=float(os.getenv("VOLUME_MULT", "2.0")),
             orb_minutes=int(os.getenv("ORB_MINUTES", "0")),
             stop_loss_field=os.getenv("STOP_LOSS_FIELD", "hold"),
