@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stocktrader-ingress
+  namespace: papertrader
+spec:
+  rules:
+    - host: trade.dizzyman.nl
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: stocktrader-dashboard
+                port:
+                  number: 5001

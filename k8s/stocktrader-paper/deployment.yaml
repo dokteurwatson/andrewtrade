@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stocktrader-dashboard
+  namespace: papertrader
+  labels:
+    app: stocktrader
+    component: dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stocktrader
+      component: dashboard
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: stocktrader
+        component: dashboard
+    spec:
+      containers:
+        - name: dashboard
+          image: registry.dizzyman.nl/stocktrader:1.1.5
+          imagePullPolicy: Always
+          command: ["python", "-m", "stocktrader.dashboard"]
+          ports:
+            - containerPort: 5001
+              name: http
+          envFrom:
+            - secretRef:
+                name: stocktrader-env
+          volumeMounts:
+            - name: state
+              mountPath: /data
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: stocktrader-state
+      nodeSelector:
+        kubernetes.io/arch: arm64

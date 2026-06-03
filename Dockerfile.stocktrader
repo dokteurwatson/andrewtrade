@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dependencies
+COPY stocktrader/requirements.txt /app/stocktrader/requirements.txt
+RUN pip install --no-cache-dir -r /app/stocktrader/requirements.txt
+
+# Code
+COPY stocktrader/ /app/stocktrader/
+
+# State dir
+RUN mkdir -p /app/stocktrader_state
+
+# Default: dashboard (kan overschreven worden voor trader-only container)
+CMD ["python", "-m", "stocktrader.dashboard"]
