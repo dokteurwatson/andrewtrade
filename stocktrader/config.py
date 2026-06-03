@@ -7,7 +7,11 @@ from dataclasses import dataclass
 class Settings:
     # Paper mode (geen IBKR nodig)
     paper_mode:       bool   # True = PaperClient, False = IBKRClient
-    paper_capital:    float  # startkapitaal voor paper trading
+    paper_capital:    float  # startkapitaal (paper mode + tracked capital bij IBKR)
+    tracked_capital:  bool   # IBKR-orders wel, sizing/cash uit state (niet IB $1M)
+    max_order_usd:    float  # harde max orderwaarde voor sizing (0 = uit)
+    max_shares_per_order: int  # harde max stuks bij sizing (0 = uit)
+    max_order_shares: int  # max stuks per IBKR market order (chunking; 0 = geen limiet)
     data_source:      str    # "yfinance" of "polygon"
     polygon_api_key:  str    # verplicht bij data_source=polygon
 
@@ -60,6 +64,10 @@ class Settings:
         return Settings(
             paper_mode=os.getenv("PAPER_MODE", "true").lower() == "true",
             paper_capital=float(os.getenv("PAPER_CAPITAL", "1000.0")),
+            tracked_capital=os.getenv("TRACKED_CAPITAL", "false").lower() == "true",
+            max_order_usd=float(os.getenv("MAX_ORDER_USD", "500.0")),
+            max_shares_per_order=int(os.getenv("MAX_SHARES_PER_ORDER", "0")),
+            max_order_shares=int(os.getenv("MAX_ORDER_SHARES", "500")),
             data_source=os.getenv("DATA_SOURCE", "yfinance"),
             polygon_api_key=os.getenv("POLYGON_API_KEY", ""),
             ibkr_host=os.getenv("IBKR_HOST", "ib-gateway"),

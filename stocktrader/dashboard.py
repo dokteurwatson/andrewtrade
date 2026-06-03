@@ -37,16 +37,37 @@ def today() -> date:
     return date.today()
 
 
-def load_state() -> DayState:
+def ibkr_wallet_cash() -> float | None:
+    if settings.paper_mode:
+        return None
+    try:
+        cash = trader.ibkr.get_cash()
+        return cash if cash > 0 else None
+    except Exception:
+        return None
+
+
+def load_state(*, sync_ibkr: bool = True) -> DayState:
     state = store.load(today(), settings.paper_capital)
-    # In IBKR mode: haal echt saldo op (gecachet door achtergrond-thread)
-    if not settings.paper_mode:
+    if settings.tracked_capital and not settings.paper_mode:
+        if state.cash <= 0:
+            store.update_cash(state, settings.paper_capital)
+    elif not settings.paper_mode:
         try:
             cash = trader.ibkr.get_cash()
             if cash > 0:
                 state.cash = cash
         except Exception:
-            pass  # IBKR niet verbonden → fallback naar opgeslagen waarde
+            pass
+        if sync_ibkr and ibkr_connected() and state.get_setups():
+            try:
+                imported = trader.sync_ibkr_positions(state, notify=False)
+                if imported:
+                    logging.info(
+                        "Dashboard: IBKR posities geïmporteerd: %s", ", ".join(imported),
+                    )
+            except Exception as exc:
+                logging.warning("Dashboard IBKR sync mislukt: %s", exc)
     return state
 
 
@@ -77,6 +98,8 @@ def index():
         day_pnl=day_pnl,
         today=today().isoformat(),
         paper_mode=settings.paper_mode,
+        tracked_capital=settings.tracked_capital,
+        ibkr_wallet=ibkr_wallet_cash(),
         ibkr_connected=ibkr_connected(),
         warn_blocked=warn_blocked,
     )
@@ -92,6 +115,7 @@ def upload():
             error="Geen geldige setups gevonden. Controleer het formaat.",
             state=load_state(), setups=[], trades=[], positions={},
             day_pnl=0, today=today().isoformat(), paper_mode=settings.paper_mode,
+            tracked_capital=settings.tracked_capital, ibkr_wallet=None,
             ibkr_connected=ibkr_connected(), warn_blocked=[],
         )
 
@@ -133,6 +157,22 @@ def stop():
     state = load_state()
     state.active = False
     store.save(state)
+    return redirect(url_for("index"))
+
+
+@app.route("/sync-positions", methods=["POST"])
+def sync_positions():
+    """Haal open IBKR-posities op en koppel aan watchlist (stop/T1 uit setup)."""
+    if settings.paper_mode:
+        return jsonify({"error": "Alleen in IBKR-modus"}), 400
+    state = load_state(sync_ibkr=False)
+    if not state.get_setups():
+        return jsonify({"error": "Eerst watchlist laden"}), 400
+    if not ibkr_connected():
+        return jsonify({"error": "IBKR niet verbonden"}), 400
+    imported = trader.sync_ibkr_positions(state, notify=True)
+    if not imported:
+        return redirect(url_for("index"))
     return redirect(url_for("index"))
 
 

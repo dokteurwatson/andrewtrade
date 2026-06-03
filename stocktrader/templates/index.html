@@ -75,7 +75,7 @@
     </div>
   </div>
   <div class="stat">
-    <div class="stat-label">{% if paper_mode %}Kapitaal{% else %}Saldo (IBKR){% endif %}</div>
+    <div class="stat-label">{% if paper_mode or tracked_capital %}Bot kapitaal{% else %}Saldo (IBKR){% endif %}</div>
     <div class="stat-value green">${{ "%.2f"|format(state.cash) }}</div>
   </div>
   <div class="stat">
@@ -100,10 +100,10 @@
 
 <div class="grid">
 
-  {% if paper_mode %}
-  <!-- Kapitaal instellen (paper) -->
+  {% if paper_mode or tracked_capital %}
+  <!-- Kapitaal instellen (paper / tracked IBKR) -->
   <div class="card" style="grid-column: 1 / -1;">
-    <h2>Kapitaal instellen (paper mode)</h2>
+    <h2>Kapitaal instellen{% if tracked_capital and not paper_mode %} (tracked — IBKR wallet genegeerd){% elif paper_mode %} (paper mode){% endif %}</h2>
     <form method="POST" action="/capital" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
       <input type="number" name="capital" step="0.01" min="1"
              value="{{ '%.2f'|format(state.cash) }}"
@@ -113,7 +113,7 @@
     </form>
   </div>
   {% else %}
-  <!-- Account saldo (live / IBKR) -->
+  <!-- Account saldo (live IBKR, geen tracked capital) -->
   <div class="card" style="grid-column: 1 / -1;">
     <h2>Account (IBKR)</h2>
     <div style="display:flex; gap:32px; flex-wrap:wrap; align-items:baseline;">
@@ -130,7 +130,23 @@
         </div>
       </div>
     </div>
-    <p class="hint" style="margin-top:12px;">Saldo komt van IB Gateway en wordt elke ~30 seconden ververst. Handmatig instellen is niet nodig in live mode.</p>
+    <p class="hint" style="margin-top:12px;">Sizing op echt IBKR-saldo. Voor paper met $1M: zet <code>TRACKED_CAPITAL=true</code>.</p>
+  </div>
+  {% endif %}
+
+  {% if not paper_mode %}
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>IBKR Gateway</h2>
+    <div style="font-size:1rem;">
+      {% if ibkr_connected %}<span class="green">● Verbonden</span>{% else %}<span class="red">● Niet verbonden</span>{% endif %}
+      {% if ibkr_wallet %}
+      <span style="color:#666; margin-left:16px;">Wallet (alleen info): <strong>${{ "%.2f"|format(ibkr_wallet) }}</strong></span>
+      {% endif %}
+    </div>
+    <form method="POST" action="/sync-positions" style="margin-top:14px;">
+      <button type="submit" class="btn btn-green">Sync IBKR-posities → dashboard</button>
+      <span class="hint" style="margin-left:8px;">Na timeout/herstart; importeert posities + stop/T1 uit watchlist.</span>
+    </form>
   </div>
   {% endif %}
 

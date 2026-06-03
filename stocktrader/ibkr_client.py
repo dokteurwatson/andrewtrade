@@ -36,6 +36,7 @@ class IBKRClient:
         otc_filter_enabled: bool = True,
         market_data_type: int = 3,
         bar_stream_mode: str = "historical",
+        max_order_shares: int = 500,
     ) -> None:
         self._host      = host
         self._port      = port
@@ -43,6 +44,7 @@ class IBKRClient:
         self._otc_filter_enabled = otc_filter_enabled
         self._market_data_type = market_data_type
         self._bar_stream_mode = bar_stream_mode.lower()
+        self._max_order_shares = max(0, max_order_shares)
         self._ib        = IB()
         self._bar_subs: Dict[str, object] = {}
         self._mdt_applied = False
@@ -198,6 +200,34 @@ class IBKRClient:
                 return float(v.value)
         return self._cached_cash
 
+    def get_stock_positions(self) -> Dict[str, dict]:
+        """Open US-aandelenposities bij IBKR: symbol → shares, avg_cost, side."""
+
+        async def _fetch():
+            if self._ib.isConnected():
+                self._ib.reqPositions()
+                await asyncio.sleep(1)
+            out: Dict[str, dict] = {}
+            for pos in self._ib.positions():
+                c = pos.contract
+                if getattr(c, "secType", "") != "STK":
+                    continue
+                qty = int(pos.position)
+                if qty == 0:
+                    continue
+                sym = c.symbol
+                avg = float(pos.avgCost or 0)
+                if avg <= 0 and getattr(pos, "averageCost", None):
+                    avg = float(pos.averageCost)
+                out[sym] = {
+                    "shares": abs(qty),
+                    "side": "long" if qty > 0 else "short",
+                    "avg_cost": avg,
+                }
+            return out
+
+        return self._run_in_loop(_fetch(), timeout=20)
+
     # ------------------------------------------------------------------
     # OTC / MiFID II filter
     # ------------------------------------------------------------------
@@ -301,6 +331,18 @@ class IBKRClient:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _chunk_shares(total: int, chunk_size: int) -> List[int]:
+        if chunk_size <= 0 or total <= chunk_size:
+            return [total]
+        parts: List[int] = []
+        left = total
+        while left > 0:
+            q = min(chunk_size, left)
+            parts.append(q)
+            left -= q
+        return parts
+
+    @staticmethod
     def _order_error_detail(trade) -> str:
         """IBKR reject/cancel reden uit trade.log en orderStatus."""
         status = getattr(trade.orderStatus, "status", "") or ""
@@ -313,43 +355,37 @@ class IBKRClient:
         return " | ".join(parts) if parts else "geen status van IBKR (check Gateway logs)"
 
     def buy_market(self, ticker: str, shares: int) -> str:
-        contract = Stock(ticker, "SMART", "USD")
-
-        async def _place():
-            qualified = await self._ib.qualifyContractsAsync(contract)
-            if not qualified:
-                raise RuntimeError(f"contract niet gekwalificeerd: {ticker}")
-            c = qualified[0]
-            order = MarketOrder("BUY", shares)
-            trade = self._ib.placeOrder(c, order)
-            for _ in range(25):
-                st = (trade.orderStatus.status or "").upper()
-                if st == "FILLED":
-                    break
-                if st in ("CANCELLED", "INACTIVE", "APICANCELLED"):
-                    raise RuntimeError(self._order_error_detail(trade))
-                await asyncio.sleep(0.2)
-            else:
-                st = (trade.orderStatus.status or "").upper()
-                if st != "FILLED":
-                    raise RuntimeError(
-                        f"order timeout status={st}: {self._order_error_detail(trade)}"
-                    )
-            return str(trade.order.orderId)
-
-        order_id = self._run_in_loop(_place(), timeout=60)
-        logging.info("BUY %s x%d  order_id=%s", ticker, shares, order_id)
-        return order_id
+        chunks = self._chunk_shares(shares, self._max_order_shares)
+        if len(chunks) > 1:
+            logging.info(
+                "BUY %s x%d in %d orders (max %d/share/order, IBKR-limiet)",
+                ticker, shares, len(chunks), self._max_order_shares,
+            )
+        timeout = max(60.0, len(chunks) * 10.0)
+        return self._run_in_loop(self._place_market_chunks(ticker, "BUY", chunks), timeout=timeout)
 
     def sell_market(self, ticker: str, shares: int) -> str:
-        contract = Stock(ticker, "SMART", "USD")
+        chunks = self._chunk_shares(shares, self._max_order_shares)
+        if len(chunks) > 1:
+            logging.info(
+                "SELL %s x%d in %d orders (max %d/share/order, IBKR-limiet)",
+                ticker, shares, len(chunks), self._max_order_shares,
+            )
+        timeout = max(60.0, len(chunks) * 10.0)
+        return self._run_in_loop(self._place_market_chunks(ticker, "SELL", chunks), timeout=timeout)
 
-        async def _place():
-            qualified = await self._ib.qualifyContractsAsync(contract)
-            if not qualified:
-                raise RuntimeError(f"contract niet gekwalificeerd: {ticker}")
-            c = qualified[0]
-            order = MarketOrder("SELL", shares)
+    async def _place_market_chunks(
+        self, ticker: str, side: str, chunks: List[int],
+    ) -> str:
+        contract = Stock(ticker, "SMART", "USD")
+        qualified = await self._ib.qualifyContractsAsync(contract)
+        if not qualified:
+            raise RuntimeError(f"contract niet gekwalificeerd: {ticker}")
+        c = qualified[0]
+        order_ids: List[str] = []
+        n = len(chunks)
+        for i, qty in enumerate(chunks, start=1):
+            order = MarketOrder(side, qty)
             trade = self._ib.placeOrder(c, order)
             for _ in range(25):
                 st = (trade.orderStatus.status or "").upper()
@@ -364,11 +400,12 @@ class IBKRClient:
                     raise RuntimeError(
                         f"order timeout status={st}: {self._order_error_detail(trade)}"
                     )
-            return str(trade.order.orderId)
-
-        order_id = self._run_in_loop(_place(), timeout=60)
-        logging.info("SELL %s x%d  order_id=%s", ticker, shares, order_id)
-        return order_id
+            oid = str(trade.order.orderId)
+            order_ids.append(oid)
+            logging.info("%s %s deel %d/%d x%d order_id=%s", side, ticker, i, n, qty, oid)
+            if i < n:
+                await asyncio.sleep(0.35)
+        return ",".join(order_ids)
 
     def close_all_positions(self) -> None:
         async def _close():
