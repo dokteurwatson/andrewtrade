@@ -4,7 +4,7 @@ Sluit alle open US-aandelenposities via IB Gateway (market orders, in chunks).
 Gebruik in de dashboard-pod (zelfde env als de bot):
 
   # Bot eerst stoppen op het dashboard, anders clientId-conflict
-  python -m stocktrader.close_all_ibkr --yes
+  python -m stocktrader.close_all_ibkr --yes --timeout 180
 
   # Alleen tonen wat er zou gebeuren:
   python -m stocktrader.close_all_ibkr --dry-run
@@ -42,20 +42,28 @@ def _chunk_shares(total: int, chunk_size: int) -> list[int]:
     return parts
 
 
-async def _wait_filled(trade, label: str) -> None:
-    for _ in range(50):
-        st = (trade.orderStatus.status or "").upper()
-        if st == "FILLED":
+async def _wait_filled(trade, label: str, timeout_sec: float = 120.0) -> None:
+    """Wacht op FILLED of reject; SUBMITTED/PreSubmitted blijven pollen tot timeout."""
+    deadline = asyncio.get_event_loop().time() + timeout_sec
+    last_st = ""
+    while asyncio.get_event_loop().time() < deadline:
+        os_ = trade.orderStatus
+        st = (os_.status or "").upper()
+        last_st = st
+        filled = float(os_.filled or 0)
+        remaining = float(os_.remaining if os_.remaining is not None else 0)
+        if st == "FILLED" or (filled > 0 and remaining == 0):
             return
         if st in ("CANCELLED", "INACTIVE", "APICANCELLED"):
+            if filled > 0:
+                log.warning("%s %s maar %s shares gevuld", label, st, filled)
+                return
             raise RuntimeError(f"{label} {st}: {trade.log}")
         await asyncio.sleep(0.25)
-    st = (trade.orderStatus.status or "").upper()
-    if st != "FILLED":
-        raise RuntimeError(f"{label} timeout status={st}")
+    raise RuntimeError(f"{label} timeout status={last_st or '?'}")
 
 
-async def run(*, dry_run: bool) -> int:
+async def run(*, dry_run: bool, order_timeout_sec: float = 120.0) -> int:
     host = os.getenv("IBKR_HOST", "ib-gateway")
     port = int(os.getenv("IBKR_PORT", "4002"))
     # Default 2 — niet 1, anders conflict met draaiende dashboard/trader (IBKR_CLIENT_ID=1)
@@ -93,13 +101,14 @@ async def run(*, dry_run: bool) -> int:
         chunks = _chunk_shares(total, max_chunk)
         log.info("%s %s totaal %d in %d order(s)", side, sym, total, len(chunks))
         for i, qty in enumerate(chunks, start=1):
-            order = MarketOrder(side, qty)
+            order = MarketOrder(side, qty, tif="IOC")
             trade = ib.placeOrder(pos.contract, order)
             label = f"{side} {sym} {i}/{len(chunks)} x{qty}"
-            await _wait_filled(trade, label)
-            log.info("%s FILLED orderId=%s", label, trade.order.orderId)
+            log.info("Plaatsen %s ...", label)
+            await _wait_filled(trade, label, timeout_sec=order_timeout_sec)
+            log.info("%s FILLED order_id=%s", label, trade.order.orderId)
             if i < len(chunks):
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(0.2)
 
     ib.reqPositions()
     await asyncio.sleep(1)
@@ -116,6 +125,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Sluit alle IBKR stock-posities")
     parser.add_argument("--dry-run", action="store_true", help="Alleen tonen, geen orders")
     parser.add_argument("--yes", action="store_true", help="Geen bevestiging (voor kubectl exec)")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Max seconden wachten per order-chunk (default 120)",
+    )
     args = parser.parse_args(argv)
 
     if not args.dry_run and not args.yes and sys.stdin.isatty():
@@ -125,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     util.patchAsyncio()
-    return asyncio.run(run(dry_run=args.dry_run))
+    return asyncio.run(run(dry_run=args.dry_run, order_timeout_sec=args.timeout))
 
 
 if __name__ == "__main__":
