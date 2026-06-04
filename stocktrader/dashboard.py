@@ -57,7 +57,7 @@ def _maybe_auto_resume() -> None:
     if not _AUTO_RESUME:
         logging.info("AUTO_RESUME_TRADING=false — geen auto-hervat na boot.")
         return
-    state = store.load(today(), settings.paper_capital)
+    state = store.load(trading_date(), settings.paper_capital)
     if not state.active or not state.get_setups():
         return
     if trader.is_engine_live():
@@ -81,7 +81,7 @@ def _maybe_auto_resume() -> None:
         if trader.is_engine_live():
             logging.info("Auto-resume: engine draait al (poging %d).", attempt)
             return
-        state = store.load(today(), settings.paper_capital)
+        state = store.load(trading_date(), settings.paper_capital)
         if not state.active or not state.get_setups():
             logging.info("Auto-resume: state niet meer actief — stoppen.")
             return
