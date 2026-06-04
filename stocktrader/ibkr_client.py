@@ -25,6 +25,39 @@ from typing import Callable, Dict, List, Optional
 
 from ib_insync import IB, MarketOrder, Stock, util
 
+# US-aandelen: sizing op USD-cash; anders EUR (FX door IB bij order)
+TRADING_CASH_CURRENCY = "USD"
+_CASH_TAGS = ("CashBalance", "TotalCashValue")
+
+
+def _parse_cash_balances(vals) -> Dict[str, float]:
+    """Per valuta cash uit accountValues (CashBalance heeft voorrang op TotalCashValue)."""
+    balances: Dict[str, float] = {}
+    for tag in _CASH_TAGS:
+        for v in vals:
+            cur = (v.currency or "").strip().upper()
+            if cur not in ("USD", "EUR"):
+                continue
+            if v.tag != tag:
+                continue
+            try:
+                amount = float(v.value)
+            except (TypeError, ValueError):
+                continue
+            if tag == "CashBalance" or cur not in balances:
+                balances[cur] = amount
+    return balances
+
+
+def _pick_trading_cash(balances: Dict[str, float]) -> tuple[float, str]:
+    usd = balances.get("USD", 0.0)
+    eur = balances.get("EUR", 0.0)
+    if usd > 0:
+        return usd, "USD"
+    if eur > 0:
+        return eur, "EUR"
+    return 0.0, TRADING_CASH_CURRENCY
+
 
 class IBKRClient:
     def __init__(
@@ -52,6 +85,8 @@ class IBKRClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
         self._cached_cash: float = 0.0
+        self._cached_balances: Dict[str, float] = {}
+        self._trading_currency: str = TRADING_CASH_CURRENCY
         util.logToConsole(logging.WARNING)
         # ib_insync bar handlers draaien op de event-loop; strategie niet synchroon daar
         self._bar_executor = concurrent.futures.ThreadPoolExecutor(
@@ -108,28 +143,24 @@ class IBKRClient:
                         await asyncio.sleep(1)
 
                     logging.info("IBKR accountValues count: %d", len(vals))
-                    found = False
-                    # Probeer USD eerst, dan BASE (EUR-account)
-                    for tag, currency in [
-                        ("TotalCashValue",       "USD"),
-                        ("CashBalance",          "USD"),
-                        ("TotalCashValue",       "BASE"),
-                        ("$LEDGER-CashBalance",  "BASE"),
-                        ("TotalCashValue",       "EUR"),
-                        ("$LEDGER-CashBalance",  "EUR"),
-                    ]:
-                        for v in vals:
-                            if v.tag == tag and v.currency == currency:
-                                self._cached_cash = float(v.value)
-                                logging.info("IBKR cash bijgewerkt: %.2f %s (tag=%s)",
-                                    self._cached_cash, currency, tag)
-                                found = True
-                                break
-                        if found:
-                            break
-                    if not found:
-                        logging.warning("IBKR cash niet gevonden — beschikbare tags: %s",
-                            list({(v.tag, v.currency) for v in vals})[:10])
+                    balances = _parse_cash_balances(vals)
+                    if balances:
+                        self._cached_balances = balances
+                        amount, cur = _pick_trading_cash(balances)
+                        self._cached_cash = amount
+                        self._trading_currency = cur
+                        parts = ", ".join(
+                            f"{c} {balances[c]:.2f}" for c in sorted(balances)
+                        )
+                        logging.info(
+                            "IBKR cash: %s | sizing US stocks: %.2f %s",
+                            parts, amount, cur,
+                        )
+                    else:
+                        logging.warning(
+                            "IBKR cash niet gevonden — tags: %s",
+                            list({(v.tag, v.currency) for v in vals})[:12],
+                        )
 
                     await asyncio.sleep(30)
 
@@ -195,8 +226,16 @@ class IBKRClient:
     # ------------------------------------------------------------------
 
     def get_cash(self) -> float:
-        """Gecachet saldo — bijgewerkt elke 30s door de achtergrond-thread."""
+        """Cash voor sizing US-aandelen (USD indien beschikbaar, anders EUR)."""
         return self._cached_cash
+
+    def get_cash_balances(self) -> Dict[str, float]:
+        """Alle bekende cash-saldi per valuta (USD/EUR)."""
+        return dict(self._cached_balances)
+
+    def get_trading_cash(self) -> tuple[float, str]:
+        """(bedrag, valuta) gebruikt door de bot voor order-sizing."""
+        return self._cached_cash, self._trading_currency
 
     def get_buying_power(self) -> float:
         vals = self._ib.accountValues()

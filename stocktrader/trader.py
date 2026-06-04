@@ -170,10 +170,23 @@ class Trader:
         with self._lock:
             st = self._state
         cash = self._portfolio_cash(st) if st else self.settings.paper_capital
-        cap_note = " (tracked)" if self.settings.tracked_capital and not self.settings.paper_mode else ""
+        cap_note = ""
+        if self.settings.tracked_capital and not self.settings.paper_mode:
+            cap_note = " (tracked uit state)"
+        elif not self.settings.paper_mode:
+            try:
+                _amt, cur = self.ibkr.get_trading_cash()
+                bals = self.ibkr.get_cash_balances()
+                if bals:
+                    cap_note = (
+                        f" | IB: {', '.join(f'{c} {bals[c]:.2f}' for c in sorted(bals))}"
+                        f" | sizing: {cur}"
+                    )
+            except Exception:
+                pass
         msg  = (
             f"Stocktrader gestart [{mode}] | {len(setups)} setups | "
-            f"Kapitaal: ${cash:.2f}{cap_note}\n"
+            f"Kapitaal sizing: {cash:.2f}{cap_note}\n"
             + ", ".join(tickers)
         )
         logging.info(msg)

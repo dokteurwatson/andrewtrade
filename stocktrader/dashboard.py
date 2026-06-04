@@ -37,14 +37,22 @@ def today() -> date:
     return date.today()
 
 
-def ibkr_wallet_cash() -> float | None:
+def ibkr_cash_info() -> dict:
+    """IBKR cash per valuta + welke de bot voor sizing gebruikt."""
     if settings.paper_mode:
-        return None
+        return {}
     try:
-        cash = trader.ibkr.get_cash()
-        return cash if cash > 0 else None
+        balances = trader.ibkr.get_cash_balances()
+        amount, currency = trader.ibkr.get_trading_cash()
+        if not balances and amount <= 0:
+            return {}
+        return {
+            "balances": balances,
+            "trading_amount": amount,
+            "trading_currency": currency,
+        }
     except Exception:
-        return None
+        return {}
 
 
 def load_state(*, sync_ibkr: bool = True) -> DayState:
@@ -52,11 +60,11 @@ def load_state(*, sync_ibkr: bool = True) -> DayState:
     if settings.tracked_capital and not settings.paper_mode:
         if state.cash <= 0:
             store.update_cash(state, settings.paper_capital)
-    elif not settings.paper_mode:
+    elif not settings.paper_mode and not settings.tracked_capital:
         try:
-            cash = trader.ibkr.get_cash()
-            if cash > 0:
-                state.cash = cash
+            amount, _cur = trader.ibkr.get_trading_cash()
+            if amount > 0:
+                state.cash = amount
         except Exception:
             pass
         if sync_ibkr and ibkr_connected() and state.get_setups():
@@ -88,6 +96,19 @@ def index():
     positions = state.get_positions()
     day_pnl   = sum(t.pnl for t in trades)
     warn_blocked = [t for t in request.args.get("warn_blocked", "").split(",") if t]
+    cash_info = ibkr_cash_info()
+    sizing_note = ""
+    if not settings.paper_mode:
+        if settings.tracked_capital:
+            sizing_note = (
+                f"Bot sized op ingesteld kapitaal (${state.cash:.2f}), niet op IB-wallet."
+            )
+        elif cash_info:
+            cur = cash_info.get("trading_currency", "USD")
+            amt = cash_info.get("trading_amount", 0)
+            sizing_note = (
+                f"Bot sized op {cur} ${amt:.2f} (US-aandelen; USD heeft voorrang op EUR)."
+            )
 
     return render_template(
         "index.html",
@@ -99,7 +120,8 @@ def index():
         today=today().isoformat(),
         paper_mode=settings.paper_mode,
         tracked_capital=settings.tracked_capital,
-        ibkr_wallet=ibkr_wallet_cash(),
+        ibkr_cash=cash_info,
+        sizing_note=sizing_note,
         ibkr_connected=ibkr_connected(),
         warn_blocked=warn_blocked,
     )
@@ -115,7 +137,8 @@ def upload():
             error="Geen geldige setups gevonden. Controleer het formaat.",
             state=load_state(), setups=[], trades=[], positions={},
             day_pnl=0, today=today().isoformat(), paper_mode=settings.paper_mode,
-            tracked_capital=settings.tracked_capital, ibkr_wallet=None,
+            tracked_capital=settings.tracked_capital,             ibkr_cash={},
+            sizing_note="",
             ibkr_connected=ibkr_connected(), warn_blocked=[],
         )
 
