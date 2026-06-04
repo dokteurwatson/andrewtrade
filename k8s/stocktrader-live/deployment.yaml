@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: dashboard
-          image: registry.dizzyman.nl/stocktrader:1.1.6
+          image: registry.dizzyman.nl/stocktrader:1.1.7
           imagePullPolicy: Always
           command: ["python", "-m", "stocktrader.dashboard"]
           ports:
