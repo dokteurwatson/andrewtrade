@@ -45,11 +45,6 @@ class IBKRClient:
         self._market_data_type = market_data_type
         self._bar_stream_mode = bar_stream_mode.lower()
         self._max_order_shares = max(0, max_order_shares)
-
-    @property
-    def _order_chunk_size(self) -> int:
-        """Max stuks per placeOrder (IBKR weigert/gecancel grote market orders)."""
-        return self._max_order_shares if self._max_order_shares > 0 else 500
         self._ib        = IB()
         self._bar_subs: Dict[str, object] = {}
         self._mdt_applied = False
@@ -70,6 +65,11 @@ class IBKRClient:
         self._loop_thread.start()
         # Wacht tot de loop draait
         self._loop_ready.wait(timeout=5)
+
+    @property
+    def _order_chunk_size(self) -> int:
+        """Max stuks per placeOrder (IBKR weigert/gecancel grote market orders)."""
+        return self._max_order_shares if self._max_order_shares > 0 else 500
 
     # ------------------------------------------------------------------
     # Interne event-loop thread
