@@ -253,8 +253,7 @@ class IBKRClient:
         """Alleen op IB-event-loop thread — geen Flask/asyncio-conflict."""
         out: Dict[str, dict] = {}
         if self._ib.isConnected():
-            self._ib.reqPositions()
-            await asyncio.sleep(1)
+            await self._ib.reqPositionsAsync()
             for pos in self._ib.positions():
                 c = pos.contract
                 if getattr(c, "secType", "") != "STK":
