@@ -6,10 +6,19 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field, asdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
+
+
+def trading_date() -> date:
+    """Handelsdag in ET — niet de server-systeemtijd."""
+    return datetime.now(_ET).date()
 
 from .parser import Setup
 
@@ -132,8 +141,19 @@ class StateStore:
 
     def save(self, state: DayState) -> None:
         f = self._file(date.fromisoformat(state.trade_date))
-        with open(f, "w") as fp:
-            json.dump(asdict(state), fp, indent=2)
+        payload = json.dumps(asdict(state), indent=2)
+        # Atomaire write: schrijf naar tmp dan replace → geen corrupt bestand bij crash
+        fd, tmp = tempfile.mkstemp(dir=self.path, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fp:
+                fp.write(payload)
+            os.replace(tmp, f)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def add_setup(self, state: DayState, setup: Setup) -> None:
         state.setups.append(asdict(setup))

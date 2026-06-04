@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -16,7 +17,8 @@ from flask import Flask, abort, jsonify, redirect, render_template, request, url
 
 from .config import Settings
 from .parser import format_setups, parse_watchlist
-from .state import StateStore, DayState
+from .state import StateStore, DayState, trading_date
+from .market_snapshot import live_snapshots
 from .trader import Trader
 
 load_dotenv()
@@ -32,9 +34,76 @@ logging.basicConfig(
 store    = StateStore(settings.state_dir)
 trader   = Trader(settings)
 
+_AUTO_RESUME = os.getenv("AUTO_RESUME_TRADING", "true").lower() == "true"
+_resume_lock = threading.Lock()
+_resume_done = False
+
+
+def _launch_trader(state: DayState, *, reason: str) -> None:
+    state.active = True
+    store.save(state)
+    trader.start(state)
+    logging.info("Trader opgestart (%s).", reason)
+
+
+def _maybe_auto_resume() -> None:
+    """Na pod-restart: hervat trading als state.active en watchlist aanwezig.
+    Probeert tot 3x met 30s interval als IBKR nog niet verbonden is."""
+    global _resume_done
+    with _resume_lock:
+        if _resume_done:
+            return
+        _resume_done = True
+    if not _AUTO_RESUME:
+        logging.info("AUTO_RESUME_TRADING=false — geen auto-hervat na boot.")
+        return
+    state = store.load(today(), settings.paper_capital)
+    if not state.active or not state.get_setups():
+        return
+    if trader.is_engine_live():
+        logging.info("Auto-resume: engine draait al.")
+        return
+
+    _MAX_RESUME_TRIES = 3
+    _RESUME_WAIT_SEC  = 30
+    for attempt in range(1, _MAX_RESUME_TRIES + 1):
+        if not settings.paper_mode:
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                try:
+                    connected = trader.ibkr.is_connected()
+                    balances  = trader.ibkr.get_cash_balances() if connected else {}
+                except Exception:
+                    connected, balances = False, {}
+                if connected and balances:
+                    break
+                time.sleep(2)
+        if trader.is_engine_live():
+            logging.info("Auto-resume: engine draait al (poging %d).", attempt)
+            return
+        state = store.load(today(), settings.paper_capital)
+        if not state.active or not state.get_setups():
+            logging.info("Auto-resume: state niet meer actief — stoppen.")
+            return
+        try:
+            _launch_trader(state, reason=f"auto-resume poging {attempt}/{_MAX_RESUME_TRIES}")
+            return
+        except Exception as exc:
+            logging.error("Auto-resume poging %d mislukt: %s", attempt, exc)
+            if attempt < _MAX_RESUME_TRIES:
+                time.sleep(_RESUME_WAIT_SEC)
+    logging.error("Auto-resume mislukt na %d pogingen.", _MAX_RESUME_TRIES)
+
+
+def _schedule_auto_resume() -> None:
+    threading.Thread(target=_maybe_auto_resume, daemon=True, name="auto-resume").start()
+
+
+_schedule_auto_resume()
+
 
 def today() -> date:
-    return date.today()
+    return trading_date()  # altijd ET, niet server-TZ
 
 
 def ibkr_cash_info() -> dict:
@@ -111,6 +180,27 @@ def index():
                 f"Bot sized op {cur} ${amt:.2f} (US-aandelen; USD heeft voorrang op EUR)."
             )
 
+    live_quotes: list = []
+    quote_by_ticker: dict = {}
+    if not settings.paper_mode and setups and ibkr_connected():
+        try:
+            live_quotes = live_snapshots(setups, settings, today())
+            quote_by_ticker = {q["ticker"]: q for q in live_quotes}
+        except Exception as exc:
+            logging.warning("Live snapshot mislukt: %s", exc)
+
+    engine_live = trader.is_engine_live()
+    bot_status = "inactief"
+    bot_hint = ""
+    if state.active and engine_live:
+        bot_status = "handelt"
+    elif state.active:
+        bot_status = "actief_zonder_engine"
+        bot_hint = (
+            "Opdracht ACTIEF in state, maar trading-engine draait niet "
+            "(vaak na pod-restart). Stop → Start, of wacht op auto-resume."
+        )
+
     return render_template(
         "index.html",
         state=state,
@@ -125,6 +215,13 @@ def index():
         sizing_note=sizing_note,
         ibkr_connected=ibkr_connected(),
         warn_blocked=warn_blocked,
+        live_quotes=live_quotes,
+        quote_by_ticker=quote_by_ticker,
+        volume_mult=settings.volume_mult,
+        orb_minutes=settings.orb_minutes,
+        engine_live=engine_live,
+        bot_status=bot_status,
+        bot_hint=bot_hint,
     )
 
 
@@ -168,10 +265,10 @@ def start():
     state = load_state()
     if not state.get_setups():
         return jsonify({"error": "Geen watchlist geladen"}), 400
-    state.active = True
-    store.save(state)
-    threading.Thread(target=trader.start, args=(state,), daemon=True).start()
-    logging.info("Trader gestart via dashboard.")
+    threading.Thread(
+        target=_launch_trader, args=(state,), kwargs={"reason": "dashboard start"},
+        daemon=True,
+    ).start()
     return redirect(url_for("index"))
 
 
@@ -270,6 +367,7 @@ def status():
     return jsonify({
         "date":           state.trade_date,
         "active":         state.active,
+        "engine_live":    trader.is_engine_live(),
         "ibkr_connected": ibkr_connected(),
         "setups":         len(state.setups),
         "positions":      len(state.positions),
@@ -281,7 +379,26 @@ def status():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    state = load_state(sync_ibkr=False)
+    engine_live   = trader.is_engine_live()
+    ibkr_ok       = ibkr_connected()
+    zombie_active = state.active and not engine_live  # state zegt actief maar engine draait niet
+
+    issues = []
+    if zombie_active:
+        issues.append("engine_not_running")
+    if state.active and not ibkr_ok and not settings.paper_mode:
+        issues.append("ibkr_disconnected")
+
+    if issues:
+        return jsonify({
+            "status":      "degraded",
+            "issues":      issues,
+            "engine_live": engine_live,
+            "ibkr":        ibkr_ok,
+        }), 200  # 200 zodat k8s liveness slaagt; aparte readiness kan 503 geven
+
+    return jsonify({"status": "ok", "engine_live": engine_live})
 
 
 if __name__ == "__main__":

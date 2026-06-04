@@ -438,6 +438,7 @@ class IBKRClient:
             qty = min(qty, self._order_chunk_size)
             order = MarketOrder(side, qty)
             trade = self._ib.placeOrder(c, order)
+            # Wacht op FILLED of PARTIALLYFILLED→FILLED (max 5s)
             for _ in range(25):
                 st = (trade.orderStatus.status or "").upper()
                 if st == "FILLED":
@@ -447,13 +448,25 @@ class IBKRClient:
                 await asyncio.sleep(0.2)
             else:
                 st = (trade.orderStatus.status or "").upper()
-                if st != "FILLED":
+                # PartiallyFilled is acceptabel — we loggen het maar gaan door
+                if st == "PARTIALLYFILLED":
+                    filled = int(trade.orderStatus.filled or 0)
+                    remaining = int(trade.orderStatus.remaining or 0)
+                    logging.warning(
+                        "%s %s deel %d/%d: PARTIALLYFILLED — gevuld=%d resterend=%d, doorgaan",
+                        side, ticker, i, n, filled, remaining,
+                    )
+                elif st != "FILLED":
                     raise RuntimeError(
                         f"order timeout status={st}: {self._order_error_detail(trade)}"
                     )
             oid = str(trade.order.orderId)
             order_ids.append(oid)
-            logging.info("%s %s deel %d/%d x%d order_id=%s", side, ticker, i, n, qty, oid)
+            filled_qty = int(trade.orderStatus.filled or qty)
+            logging.info(
+                "%s %s deel %d/%d x%d (gevuld=%d) order_id=%s",
+                side, ticker, i, n, qty, filled_qty, oid,
+            )
             if i < n:
                 await asyncio.sleep(0.35)
         return ",".join(order_ids)

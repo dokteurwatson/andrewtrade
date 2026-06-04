@@ -75,6 +75,9 @@ class Trader:
 
         self._state: Optional[DayState] = None
         self._running = False
+        self._engine_live = False
+        self._loop_thread: Optional[threading.Thread] = None
+        self._last_bar: Dict[str, float] = {}  # ticker → time.monotonic() van laatste bar
 
     # ------------------------------------------------------------------
     # Publieke interface
@@ -91,16 +94,30 @@ class Trader:
                 self.store.update_cash(state, self.settings.paper_capital)
         logging.info("Dagstate geladen: %d setups", len(state.setups))
 
+    def is_engine_live(self) -> bool:
+        """True als de trading-loop draait en bar-stream actief is (niet alleen state.active)."""
+        t = self._loop_thread
+        return self._engine_live and t is not None and t.is_alive()
+
     def start(self, state: DayState) -> None:
         """Start de tradingloop voor vandaag."""
+        if self.is_engine_live():
+            logging.info("Trader draait al — start overgeslagen.")
+            return
+        if self._loop_thread is not None and self._loop_thread.is_alive():
+            logging.warning("Trader-thread start nog — dubbele start overgeslagen.")
+            return
         self.load_day(state)
         self._running = True
-        t = threading.Thread(target=self._run_loop, daemon=True)
+        self._engine_live = False
+        t = threading.Thread(target=self._run_loop, daemon=True, name="trader-loop")
+        self._loop_thread = t
         t.start()
         logging.info("Trader gestart.")
 
     def stop(self) -> None:
         self._running = False
+        self._engine_live = False
         self.ibkr.stop_stream()
         # Verbinding blijft actief voor dashboard cash-polling
 
@@ -109,6 +126,25 @@ class Trader:
     # ------------------------------------------------------------------
 
     def _run_loop(self) -> None:
+        try:
+            self._run_loop_inner()
+        except Exception as exc:
+            logging.error("Trading-loop onverwachte fout: %s", exc, exc_info=True)
+            self.notifier.send(f"KRITIEK: trading-loop gecrasht: {exc}")
+        finally:
+            self._running = False
+            self._engine_live = False
+            # Zet active=False in state zodat dashboard/UI niet "HANDELT" toont
+            with self._lock:
+                state = self._state
+            if state is not None:
+                try:
+                    state.active = False
+                    self.store.save(state)
+                except Exception:
+                    pass
+
+    def _run_loop_inner(self) -> None:
         setups = self._state.get_setups() if self._state else []
         if not setups:
             logging.warning("Geen setups geladen — trader stopt.")
@@ -191,6 +227,12 @@ class Trader:
         )
         logging.info(msg)
         self.notifier.send(msg)
+        self._engine_live = True
+
+        # Reset bar-timestamps bij (her)start
+        self._last_bar = {t: time.monotonic() for t in tickers}
+        _STALE_BAR_SEC = 300  # 5 min zonder bar → stream waarschijnlijk gestorven
+        _stale_warned: set = set()
 
         # Wacht tot EOD exit tijd
         while self._running:
@@ -200,6 +242,56 @@ class Trader:
             ):
                 self._eod_exit()
                 break
+
+            # --- IBKR-disconnect detectie + stream-reconnect ---
+            if not self.settings.paper_mode and not self.ibkr.is_connected():
+                logging.warning("IBKR disconnect gedetecteerd — wacht op reconnect...")
+                self.notifier.send("IBKR verbinding verbroken — wacht op reconnect")
+                self._engine_live = False
+                # Wacht tot achtergrond-loop opnieuw verbindt (max 120s)
+                for _ in range(24):
+                    time.sleep(5)
+                    if self.ibkr.is_connected() and self.ibkr.get_cash_balances():
+                        break
+                if self.ibkr.is_connected():
+                    logging.info("IBKR reconnect — bar-streams opnieuw subscriben")
+                    self.notifier.send("IBKR reconnect — bar-streams hervatten")
+                    try:
+                        self.ibkr.stop_stream()
+                        self.ibkr.subscribe_bars(tickers, self._on_bar)
+                        self.ibkr.start_stream()
+                        self._last_bar = {t: time.monotonic() for t in tickers}
+                        _stale_warned.clear()
+                        self._engine_live = True
+                    except Exception as exc:
+                        logging.error("Stream-reconnect mislukt: %s", exc)
+                        self.notifier.send(f"Stream-reconnect mislukt: {exc} — stoppen")
+                        break
+                else:
+                    logging.error("IBKR reconnect timeout — trader stopt")
+                    self.notifier.send("IBKR reconnect timeout — trader stopt")
+                    break
+
+            # --- Stale-bar watchdog ---
+            if self._engine_live:
+                now_mono = time.monotonic()
+                for tkr, last_t in self._last_bar.items():
+                    age = now_mono - last_t
+                    if age > _STALE_BAR_SEC and tkr not in _stale_warned:
+                        logging.warning(
+                            "STALE BAR: %s — geen bar in %.0fs (stream mogelijk dood)",
+                            tkr, age,
+                        )
+                        _stale_warned.add(tkr)
+                # Als ALLE tickers stale zijn: hard alarm
+                if _stale_warned and len(_stale_warned) >= len(tickers):
+                    logging.error("Alle bar-streams stale — Telegram alarm")
+                    self.notifier.send(
+                        f"ALARM: alle {len(tickers)} tickers geen bar in >{_STALE_BAR_SEC}s "
+                        f"— stream waarschijnlijk dood. Herstart de bot."
+                    )
+                    _stale_warned.clear()  # reset zodat alarm niet elke 15s afgaat
+
             time.sleep(15)
 
         self.stop()
@@ -231,6 +323,7 @@ class Trader:
             self._bar_count[ticker] += 1
             bar_num = self._bar_count[ticker]
 
+            self._last_bar[ticker] = time.monotonic()
             logging.debug(
                 "BAR #%d %s  O=%.4f H=%.4f L=%.4f C=%.4f V=%.0f%s",
                 bar_num, ticker, open_, high, low, close, volume,
@@ -544,18 +637,28 @@ class Trader:
             )
             return
 
-        spend = shares * size_price
+        # Gebruik werkelijke fill-prijs als beschikbaar; val terug op size_price
+        fill_price = size_price
+        if not self.settings.paper_mode:
+            try:
+                actual = self.ibkr.get_latest_price(setup.ticker)
+                if actual and actual > 0:
+                    fill_price = actual
+            except Exception:
+                pass
+
+        spend = shares * fill_price
         self._debit_cash(state, spend)
         self._record_position(
-            state, setup, shares, setup.break_,
+            state, setup, shares, fill_price,
             order_id=order_id,
             label=f"ENTRY [{mode}]",
             notify=True,
         )
         max_loss = (setup.break_ - setup.hold) * shares
         logging.info(
-            "ENTRY %s R:R %.1fx portfolio=$%.2f max_loss=$%.2f",
-            setup.ticker, setup.rr_t1(), portfolio, max_loss,
+            "ENTRY %s R:R %.1fx portfolio=$%.2f max_loss=$%.2f fill=%.4f (size_ref=%.4f)",
+            setup.ticker, setup.rr_t1(), portfolio, max_loss, fill_price, size_price,
         )
 
     # ------------------------------------------------------------------
@@ -652,7 +755,26 @@ class Trader:
         logging.info("EOD: %d posities sluiten...", len(positions))
         self.notifier.send(f"EOD: {len(positions)} posities sluiten...")
 
+        _MAX_EOD_TRIES = 3
         for ticker, pos in positions.items():
             price = self.ibkr.get_latest_price(ticker) or pos.entry_price
-            with self._lock:
-                self._exit(state, pos, price, "EOD")
+            for attempt in range(1, _MAX_EOD_TRIES + 1):
+                try:
+                    with self._lock:
+                        self._exit(state, pos, price, "EOD")
+                    break
+                except Exception as exc:
+                    if attempt < _MAX_EOD_TRIES:
+                        logging.warning(
+                            "EOD exit %s poging %d mislukt (%s) — opnieuw...",
+                            ticker, attempt, exc,
+                        )
+                        time.sleep(2)
+                    else:
+                        logging.error(
+                            "EOD exit %s definitief mislukt na %d pogingen: %s",
+                            ticker, _MAX_EOD_TRIES, exc,
+                        )
+                        self.notifier.send(
+                            f"EOD EXIT MISLUKT {ticker} na {_MAX_EOD_TRIES} pogingen: {exc}"
+                        )
