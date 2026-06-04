@@ -26,8 +26,6 @@ class Settings:
     # Strategie
     volume_mult:       float  # breakout candle moet X keer het ORB gemiddelde zijn
     orb_minutes:       int    # opening range duur (0 = geen ORB filter)
-    stop_loss_field:   str    # "hold" — uit de watchlist
-    target_field:      str    # "t1"   — uit de watchlist
 
     # Kapitaal & risicobeheer
     cash_reserve_pct:        float  # % cash buffer (fees)
@@ -84,8 +82,6 @@ class Settings:
             ibkr_bar_stream=os.getenv("IBKR_BAR_STREAM", "historical").lower(),
             volume_mult=float(os.getenv("VOLUME_MULT", "2.0")),
             orb_minutes=int(os.getenv("ORB_MINUTES", "0")),
-            stop_loss_field=os.getenv("STOP_LOSS_FIELD", "hold"),
-            target_field=os.getenv("TARGET_FIELD", "t1"),
             cash_reserve_pct=float(os.getenv("CASH_RESERVE_PCT", "0.02")),
             risk_threshold_usd=float(os.getenv("RISK_THRESHOLD_USD", "200.0")),
             risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.02")),

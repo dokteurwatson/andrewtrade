@@ -17,22 +17,15 @@ from typing import Dict, List, Optional
 import warnings
 warnings.filterwarnings("ignore")
 
-import yfinance as yf
 import pandas as pd
+
+from stocktrader.market_data import fetch_1m
+from stocktrader.parser import Setup
 
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
-
-@dataclass
-class Setup:
-    ticker: str
-    hold:   float
-    break_: float
-    t1:     float
-    t2:     float
-
 
 @dataclass
 class TradeResult:
@@ -433,27 +426,6 @@ WATCHLISTS: Dict[date, List[Setup]] = {
 
 
 # ---------------------------------------------------------------------------
-# Data ophalen
-# ---------------------------------------------------------------------------
-
-def fetch_intraday(ticker: str, trade_date: date) -> Optional[pd.DataFrame]:
-    from datetime import datetime, timedelta
-    start = datetime.combine(trade_date, datetime.min.time())
-    end   = start + timedelta(days=1)
-    df = yf.download(ticker, start=start, end=end, interval="1m", progress=False, auto_adjust=True)
-    if df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if df.index.tzinfo is None:
-        df.index = df.index.tz_localize("America/New_York")
-    else:
-        df.index = df.index.tz_convert("America/New_York")
-    df = df.between_time("09:30", "15:59")
-    return df if not df.empty else None
-
-
-# ---------------------------------------------------------------------------
 # Backtest één dag
 # ---------------------------------------------------------------------------
 
@@ -619,7 +591,7 @@ def main() -> None:
         # Data ophalen
         data: Dict[str, Optional[pd.DataFrame]] = {}
         for ticker in tickers:
-            data[ticker] = fetch_intraday(ticker, trade_date)
+            data[ticker] = fetch_1m(ticker, trade_date)
 
         day_capital = capital
         end_cash, trades = run_day(watchlist, data, day_capital, orb_minutes=args.orb)

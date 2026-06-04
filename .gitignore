@@ -6,6 +6,7 @@ __pycache__/
 
 .env
 state/
+backtest_out.txt
 
 build/
 dist/

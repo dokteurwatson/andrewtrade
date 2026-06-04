@@ -7,51 +7,19 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date, datetime, time as dt_time, timedelta
+from datetime import date
 from typing import Dict, List, Optional
-from zoneinfo import ZoneInfo
-
-import pandas as pd
-import yfinance as yf
 
 from .config import Settings
+from .market_data import ET, fetch_1m, orb_avg_volume
 from .parser import Setup
-from .state import trading_date as _et_date  # noqa: F401 (re-exported voor gebruikers)
 
-ET = ZoneInfo("America/New_York")
 _CACHE_TTL_SEC = 55
 _cache: Dict[str, object] = {"ts": 0.0, "rows": []}
 
 
-def _fetch_1m(ticker: str, trade_date: date) -> Optional[pd.DataFrame]:
-    start = datetime.combine(trade_date, dt_time.min)
-    end = start + timedelta(days=1)
-    try:
-        df = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            interval="1m",
-            progress=False,
-            auto_adjust=True,
-        )
-    except Exception as exc:
-        logging.debug("snapshot %s: %s", ticker, exc)
-        return None
-    if df is None or df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if df.index.tzinfo is None:
-        df.index = df.index.tz_localize("UTC").tz_convert(ET)
-    else:
-        df.index = df.index.tz_convert(ET)
-    df = df.between_time("09:30", "15:59")
-    return df if not df.empty else None
-
-
 def _snapshot_row(setup: Setup, settings: Settings, trade_date: date) -> dict:
-    df = _fetch_1m(setup.ticker, trade_date)
+    df = fetch_1m(setup.ticker, trade_date)
     if df is None:
         return {
             "ticker": setup.ticker,
@@ -66,14 +34,13 @@ def _snapshot_row(setup: Setup, settings: Settings, trade_date: date) -> dict:
     orb_min = settings.orb_minutes
     vol_mult = settings.volume_mult
     orb_vols: List[float] = []
-    orb_avg: Optional[float] = None
 
     for i, (_, row) in enumerate(df.iterrows(), start=1):
         v = float(row["Volume"])
         if orb_min > 0 and i <= orb_min:
             orb_vols.append(v)
-        elif orb_vols:
-            orb_avg = sum(orb_vols) / len(orb_vols)
+
+    orb_avg = orb_avg_volume(orb_vols)
 
     last = df.iloc[-1]
     ts = df.index[-1]

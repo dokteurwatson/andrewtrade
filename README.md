@@ -1,277 +1,177 @@
-# AndrewTrade Paper Trader
+# AndrewTrade — Stocktrader
 
-`andrewtrade` is a Dockerized paper trading bot that uses Kraken market data on a `4h` strategy and sends Telegram updates for startup, entries, exits, runtime errors, and a Bugatti-progress message after each profitable sell.
+US equities intraday bot voor **Krush watchlist**-setups: breakout boven Break-niveau met volumefilter (ORB-gemiddelde × `VOLUME_MULT`), stop op Hold, target op T1, flatten vóór marktsluiting.
 
-## Features
+Flask-dashboard om watchlists te uploaden, de bot te starten/stoppen en live status te zien. Uitvoering via **IBKR Gateway** (live/paper) of **PaperClient** (yfinance/Polygon, geen IBKR).
 
-- Strategy rules:
-  - Entry: `Close > SMA(200)` and `RSI(2) < 20`
-  - Exit: `RSI(2) > 70` or stop-loss (above threshold mode)
-- Coin universe via env array (`COIN_LIST`) with default `BTC,ETH,XRP`
-- Balance-threshold risk switch:
-  - Below threshold: all-in mode
-  - At/above threshold: risk-based sizing + hard limits
-- Telegram notifications:
-  - startup
-  - entry
-  - exit
-  - runtime error
-  - Bugatti progress on profitable exits
-- State persistence in `./state`
-- Built-in dashboard with:
-  - cash display
-  - ongoing and completed trades
-  - dynamic trade potential scoring
-  - candle chart with projected strategy entry/exit markers
+## Architectuur
 
-## Project Layout
+```mermaid
+flowchart TB
+  subgraph ui [Flask dashboard]
+    Upload[POST /upload]
+    Start[POST /start]
+    Stop[POST /stop]
+    Health[GET /health]
+  end
 
-- App package: `papertrader/`
-- Tests: `tests/`
-- Runtime state: `state/`
-- Config template: `.env.example`
+  subgraph persist [Persistence]
+    SS[StateStore JSON per dag ET]
+  end
 
-## Requirements
+  subgraph engine [Trader thread]
+    Loop[run_loop]
+    OnBar[on_bar strategie]
+  end
 
-- Docker + Docker Compose
-- Telegram bot token + chat id for alerts
+  subgraph brokers [Execution]
+    Paper[PaperClient]
+    IBKR[IBKRClient ib_insync]
+  end
 
-## Quick Start
+  Upload --> SS
+  Start --> Loop
+  Loop --> OnBar
+  OnBar --> Paper
+  OnBar --> IBKR
+  Loop --> SS
+  OnBar --> SS
+  SS --> ui
+  Notifier[Notifier Telegram]
+  OnBar --> Notifier
+```
 
-1. Copy env template:
+**Typische dag**
+
+1. Watchlist plakken in dashboard → `parse_watchlist` → `StateStore`.
+2. **Start** → `state.active=true`, `Trader`-thread start.
+3. Verbinding (IB Gateway of paper), OTC-filter, 1m bar-stream.
+4. Per bar: ORB-volume opbouwen, breakout + volume → entry; Hold/T1 exits; ~15:55 ET EOD.
+5. Pod-restart: bij `AUTO_RESUME_TRADING=true` en `state.active` wordt de engine opnieuw gestart.
+
+## Project layout
+
+| Pad | Doel |
+|-----|------|
+| `stocktrader/` | Runtime: dashboard, trader, IBKR/paper, state |
+| `stocktrader/.env.example` | Configuratie-template |
+| `backtest_*.py` | Offline backtests (yfinance) |
+| `k8s/stocktrader-live/` | Live dashboard + state PVC |
+| `k8s/stocktrader-paper/` | Paper-omgeving + ingress |
+| `Dockerfile.stocktrader` | Image `registry.dizzyman.nl/stocktrader` |
+| `tests/` | pytest (parser, state, market_data) |
+
+## Vereisten
+
+- Python 3.11+
+- Live: **IB Gateway** bereikbaar (`IBKR_HOST`, poort 4002 paper / 4001 live)
+- Optioneel: Telegram bot voor alerts
+
+## Lokaal starten
 
 ```bash
-cp .env.example .env
+cd andrewtrade
+cp stocktrader/.env.example .env
+# vul .env in (minimaal PAPER_MODE, STATE_DIR, evt. IBKR_*)
+
+pip install -r stocktrader/requirements.txt
+python -m stocktrader.dashboard
 ```
 
-2. Fill Telegram credentials in `.env`:
+Dashboard: `http://localhost:5001` (poort via `DASHBOARD_PORT`).
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+## Belangrijkste omgevingsvariabelen
 
-3. Optional watchlist override with DOGE:
+| Variabele | Default | Beschrijving |
+|-----------|---------|--------------|
+| `PAPER_MODE` | `true` | `true` = PaperClient, `false` = IBKR |
+| `PAPER_CAPITAL` | `1000` | Startkapitaal (paper / tracked) |
+| `TRACKED_CAPITAL` | `false` | IBKR-orders wel, sizing uit state |
+| `IBKR_HOST` | `ib-gateway` | Gateway host (k8s service) |
+| `IBKR_PORT` | `4002` | 4002 paper, 4001 live |
+| `IBKR_CLIENT_ID` | `1` | Uniek per verbinding |
+| `VOLUME_MULT` | `2.0` | Breakout-volume ≥ mult × ORB-gem. |
+| `ORB_MINUTES` | `0` | ORB-window (0 = uit) |
+| `AUTO_RESUME_TRADING` | `true` | Hervat na pod-restart |
+| `STATE_DIR` | `./stocktrader_state` | JSON per dag (`YYYY-MM-DD.json`) |
+| `TELEGRAM_ENABLED` | `false` | Alerts aan/uit |
 
-```env
-COIN_LIST=["BTC","ETH","XRP","DOGE"]
+Volledige lijst: [`stocktrader/.env.example`](stocktrader/.env.example).
+
+## Watchlist-formaat
+
+Tabellen, tabs, bullets of Telegram-markdown; vier prijskolommen na ticker:
+
+```
+Stock  Hold    Break   Target1  Target2
+XOS    $6.30   $7.00   $8.00    $10.00
+STAK   3.50    3.90    4.50     5.00
 ```
 
-4. Start:
+Parser: `stocktrader.parser.parse_watchlist`.
+
+## Strategie (live bot)
+
+- **Entry:** `high >= break_` en `volume >= VOLUME_MULT × orb_avg` (na optionele eerste `ORB_MINUTES` bars alleen volume tellen).
+- **Exit:** low ≤ Hold (STOP), high ≥ T1 (T1).
+- **EOD:** alle open posities ~15:55 ET.
+- **Sizing:** onder `RISK_THRESHOLD_USD` all-in; daarboven risico-based + positiecaps.
+
+Backtests kunnen extra filters hebben (bv. ORB-high in scenario B/C); zie scripts hieronder.
+
+## Docker image
 
 ```bash
-docker compose up --build -d
+docker build -f Dockerfile.stocktrader -t registry.dizzyman.nl/stocktrader:1.1.7 .
+docker push registry.dizzyman.nl/stocktrader:1.1.7
 ```
 
-If you hit an image-name conflict while building both services, run:
+## Kubernetes
+
+**Live** (`stocktrader-live`):
 
 ```bash
-docker compose build andrewtrade-api
-docker compose up -d
+kubectl apply -k k8s/stocktrader-live/
+kubectl rollout status deployment/stocktrader-dashboard -n stocktrader-live
 ```
 
-The dashboard service reuses the same built image and does not trigger a second build.
+- Image: `registry.dizzyman.nl/stocktrader:1.1.7`
+- State PVC gemount op `/data` → `STATE_DIR=/data` in secret
+- Probes: `GET /health` (degraded als `active` maar engine niet live)
+- `replicas: 1`, `strategy: Recreate`
 
-5. Follow logs:
+**Paper** (`papertrader` namespace): `k8s/stocktrader-paper/` met ingress `trade.dizzyman.nl`.
+
+Secret `stocktrader-env`: kopieer van `secret.yaml` templates en vul IBKR/Telegram in.
+
+## Backtest-scripts
+
+| Script | Gebruik |
+|--------|---------|
+| `backtest_watchlist.py` | Eén dag, scenario A/B/C (B/C: ORB-high filter — **niet** live) |
+| `backtest_multi_day.py` | Meerdere dagen, compounding cash pool |
+| `backtest_recent_window.py` | Laatste N minuten; **dichtst bij live** entry-logica |
+| `backtest_jun03.py` | Wrapper één dag |
 
 ```bash
-docker compose logs -f papertrader
+python backtest_watchlist.py --date 2026-06-04 --capital 105
+python backtest_recent_window.py --minutes 20
+python backtest_multi_day.py --capital 50
 ```
 
-API logs:
+## Hulpmiddelen
+
+- **Liquidatie IBKR:** `python -m stocktrader.close_all_ibkr --yes` (limit DAY; apart van bot EOD market exits).
+
+## Tests
 
 ```bash
-docker compose logs -f andrewtrade-api
+pip install -r stocktrader/requirements.txt pytest
+pytest -q tests/
 ```
 
-Dashboard logs:
+## Notities
 
-```bash
-docker compose logs -f andrewtrade-dash
-```
-
-6. Stop:
-
-```bash
-docker compose down
-```
-
-Dashboard (when running locally):
-
-- `http://localhost:8000`
-
-## Environment Variables
-
-Core:
-
-- `MODE=paper`
-- `EXCHANGE_ID=kraken`
-- `TIMEFRAME=4h`
-- `COIN_LIST=["BTC","ETH","XRP"]`
-- `PAPER_START_CAPITAL_USD=50`
-
-Risk model:
-
-- `RISK_THRESHOLD_BALANCE=100`
-- `POSITION_SIZING_BELOW_THRESHOLD=all_in`
-- `RISK_PER_TRADE_ABOVE_THRESHOLD=0.01`
-- `STOP_LOSS_PCT_ABOVE_THRESHOLD=0.02`
-- `MAX_DAILY_LOSS_ABOVE_THRESHOLD=0.03`
-- `MAX_OPEN_POSITIONS_ABOVE_THRESHOLD=1`
-- `MAX_CONSECUTIVE_LOSSES_ABOVE_THRESHOLD=3`
-- `COOLDOWN_CANDLES_AFTER_LIMIT=3`
-
-Costs:
-
-- `TAKER_FEE_RATE=0.0026`
-- `SLIPPAGE_RATE=0.0005`
-
-Runtime:
-
-- `POLL_SECONDS=60`
-- `CANDLE_LIMIT=300`
-- `MIN_ORDER_USD=10`
-- `STATE_DIR=./state`
-- `LOG_LEVEL=INFO` (`DEBUG`, `WARNING`, `ERROR` also supported)
-
-Telegram:
-
-- `TELEGRAM_ENABLED=true`
-- `TELEGRAM_BOT_TOKEN=...`
-- `TELEGRAM_CHAT_ID=...`
-
-Bugatti tracker:
-
-- `BUGATTI_TARGET_USD=2000000` (defaults to entry-level Bugatti territory)
-
-## Telegram Messages You Get
-
-- Startup message with exchange/timeframe/coins/cash/mode
-- Entry message with symbol, size, indicators, fee
-- Exit message with reason, PnL, fee
-- Runtime error message if a cycle fails
-- Extra message after profitable exit with:
-  - target progress percentage
-  - a fun status line based on percentage range
-
-## Docker Registry
-
-Compose is set up with image:
-
-- `registry.dizzyman.nl/andrewtrade:latest`
-
-Build and push manually:
-
-```bash
-docker build -t registry.dizzyman.nl/andrewtrade:latest .
-docker push registry.dizzyman.nl/andrewtrade:latest
-```
-
-## Kubernetes / Helm Deployment
-
-Use these defaults for cluster deploys.
-
-### Required persistence path
-
-- Mount persistent storage at: `/app/state`
-- Set env var: `STATE_DIR=/app/state`
-
-This persists:
-
-- `/app/state/paper_state.json` (cash, positions, cooldown/day state)
-- `/app/state/trades.jsonl` (trade event log)
-
-### Required secrets/config
-
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-- Optional: move all env config into a ConfigMap + Secret split
-
-### Minimal Helm values example
-
-```yaml
-image:
-  repository: registry.dizzyman.nl/andrewtrade
-  tag: latest
-  pullPolicy: IfNotPresent
-
-env:
-  MODE: "paper"
-  EXCHANGE_ID: "kraken"
-  TIMEFRAME: "4h"
-  COIN_LIST: '["BTC","ETH","XRP"]'
-  PAPER_START_CAPITAL_USD: "50"
-  STATE_DIR: "/app/state"
-  LOG_LEVEL: "INFO"
-  TELEGRAM_ENABLED: "true"
-
-secretEnv:
-  TELEGRAM_BOT_TOKEN: "<set-in-secret>"
-  TELEGRAM_CHAT_ID: "<set-in-secret>"
-
-persistence:
-  enabled: true
-  size: 1Gi
-  accessMode: ReadWriteOnce
-  mountPath: /app/state
-```
-
-### Deployment notes
-
-- Run a single replica (`replicaCount: 1`) to avoid multiple bots trading the same paper wallet.
-- Keep rolling updates simple (`maxUnavailable: 0`, `maxSurge: 1`) so only one active pod remains.
-- If your registry is private, configure `imagePullSecrets` in the chart.
-- Add resource requests/limits so pod eviction risk is lower on busy clusters.
-
-### Example upgrade command
-
-```bash
-helm upgrade --install andrewtrade ./chart \
-  --set image.repository=registry.dizzyman.nl/andrewtrade \
-  --set image.tag=latest
-```
-
-## Testing
-
-Run tests locally:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt pytest
-pytest -q
-```
-
-Current suite covers config parsing, indicators, and key runner risk flows.
-
-## Trade Frequency Estimation
-
-To estimate expected entry/exit count per month with your current strategy settings:
-
-```bash
-python -m papertrader.backtest_frequency
-```
-
-This pulls recent OHLC candles from Kraken using your `.env` config (`COIN_LIST`, `TIMEFRAME`, `CANDLE_LIMIT`, RSI/SMA thresholds) and prints:
-
-- entries per symbol
-- exits per symbol
-- approximate months covered
-- entries per month per symbol
-- portfolio aggregate entries/month
-
-## Notes
-
-- This bot is paper-only right now (`MODE=paper`).
-- No live Kraken order placement is implemented yet.
-
-## Dashboard Server
-
-Run the dashboard API + frontend:
-
-```bash
-uvicorn papertrader.dashboard:app --host 0.0.0.0 --port 8000
-```
-
-Endpoints:
-
-- `GET /api/dashboard` -> wallet/trades/potential summary
-- `GET /api/chart?symbol=BTC/USD&limit=350` -> candles + SMA + projected ENTRY/EXIT markers
+- Handelsdag en markturen: **America/New_York** (ET), niet server-TZ.
+- Dashboard **HANDELT** = engine-thread live; **ACTIEF — engine uit** = alleen `state.active` op schijf.
+- yfinance in dashboard snapshots heeft ~15 min vertraging; live bars komen van IBKR bij `PAPER_MODE=false`.

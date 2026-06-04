@@ -20,6 +20,9 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import yfinance as yf
 
+from .market_data import fetch_1m
+from .state import trading_date
+
 if TYPE_CHECKING:
     from .state import DayState, StateStore
 
@@ -233,12 +236,9 @@ class PaperClient:
             self._emit_yfinance_bar(ticker, callback)
 
     def _emit_yfinance_bar(self, ticker: str, callback) -> None:
-        import pandas as pd
-        data = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=True)
-        if data.empty or len(data) < 2:
+        data = fetch_1m(ticker, trading_date())
+        if data is None or len(data) < 2:
             return
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
         bar = data.iloc[-2]
         ts  = str(data.index[-2])
         if self._last_bar.get(ticker) == ts:

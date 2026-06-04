@@ -57,6 +57,11 @@
   De rest kun je wel starten. Controleer in TWS of het echt OTC is.
 </div>
 {% endif %}
+{% if bot_hint %}
+<div class="error" style="background:#332200;color:#ffcc00;">
+  <strong>Let op:</strong> {{ bot_hint }}
+</div>
+{% endif %}
 
 <!-- Status bar -->
 <div class="status-bar">
@@ -71,7 +76,13 @@
   <div class="stat">
     <div class="stat-label">Bot</div>
     <div class="stat-value">
-      {% if state.active %}<span class="active-dot"></span><span class="green">ACTIEF</span>{% else %}<span style="color:#666">INACTIEF</span>{% endif %}
+      {% if bot_status == 'handelt' %}
+        <span class="active-dot"></span><span class="green">HANDELT</span>
+      {% elif bot_status == 'actief_zonder_engine' %}
+        <span class="yellow">ACTIEF — engine uit</span>
+      {% else %}
+        <span style="color:#666">INACTIEF</span>
+      {% endif %}
     </div>
   </div>
   <div class="stat">
@@ -211,8 +222,12 @@ MASK   $3.80   $4.20   $6.75     $8.40
     <h2>Geladen setups ({{ setups|length }})</h2>
     {% if setups %}
     <table>
-      <tr><th>Ticker</th><th>Hold</th><th>Break</th><th>T1</th><th>T2</th><th>R:R</th><th>Stop%</th></tr>
+      <tr>
+        <th>Ticker</th><th>Hold</th><th>Break</th><th>T1</th><th>T2</th><th>R:R</th><th>Stop%</th>
+        {% if live_quotes %}<th>Last</th><th>Bar H</th><th>Vol</th><th>Vol≥</th><th>Status</th>{% endif %}
+      </tr>
       {% for s in setups %}
+      {% set q = quote_by_ticker.get(s.ticker) %}
       <tr>
         <td><strong>{{ s.ticker }}</strong></td>
         <td>${{ "%.2f"|format(s.hold) }}</td>
@@ -221,9 +236,25 @@ MASK   $3.80   $4.20   $6.75     $8.40
         <td>${{ "%.2f"|format(s.t2) }}</td>
         <td>{{ "%.1f"|format(s.rr_t1()) }}x</td>
         <td class="red">{{ "%.1f"|format(s.risk_pct()) }}%</td>
+        {% if live_quotes %}
+        <td>{% if q and q.last is not none %}${{ "%.2f"|format(q.last) }}{% else %}—{% endif %}</td>
+        <td>{% if q and q.high is not none %}${{ "%.2f"|format(q.high) }}{% else %}—{% endif %}</td>
+        <td>{% if q and q.volume is not none %}{{ "%.0f"|format(q.volume) }}{% else %}—{% endif %}</td>
+        <td>{% if q and q.vol_need is not none %}{{ "%.0f"|format(q.vol_need) }}{% else %}—{% endif %}</td>
+        <td style="font-size:0.8rem;">
+          {% if q %}
+          <span class="{% if q.status == 'breakout OK' %}green{% elif q.status == 'break, vol laag' %}yellow{% else %}hint{% endif %}">
+            {{ q.status }}{% if q.bar_time %} ({{ q.bar_time }}){% endif %}
+          </span>
+          {% else %}—{% endif %}
+        </td>
+        {% endif %}
       </tr>
       {% endfor %}
     </table>
+    {% if live_quotes %}
+    <p class="hint">Live kolommen: yfinance 1m (~15 min delay). Vol≥ = {{ volume_mult }}× ORB{% if orb_minutes > 0 %} (eerste {{ orb_minutes }} min){% else %} uit{% endif %}.</p>
+    {% endif %}
     <div class="controls" style="margin-top:14px">
       {% if not state.active %}
         <form method="POST" action="/start">

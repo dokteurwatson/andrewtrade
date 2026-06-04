@@ -26,22 +26,15 @@ from typing import Optional
 import warnings
 warnings.filterwarnings("ignore")
 
-import yfinance as yf
 import pandas as pd
+
+from stocktrader.market_data import fetch_1m
+from stocktrader.parser import Setup
 
 
 # ---------------------------------------------------------------------------
 # Watchlist
 # ---------------------------------------------------------------------------
-
-@dataclass
-class Setup:
-    ticker: str
-    hold:   float
-    break_: float
-    t1:     float
-    t2:     float
-
 
 WATCHLIST = [
     Setup("HUBC",  0.35,  0.40,  0.50,  0.60),
@@ -55,37 +48,6 @@ WATCHLIST = [
     Setup("MASK",  3.80,  4.20,  6.75,  8.40),
     Setup("MNTS",  18.30, 20.30, 35.00, 43.50),
 ]
-
-
-# ---------------------------------------------------------------------------
-# Data ophalen
-# ---------------------------------------------------------------------------
-
-def fetch_intraday(ticker: str, trade_date: date) -> Optional[pd.DataFrame]:
-    """Haal 1m candles op voor één dag. Geeft None als geen data."""
-    start = datetime.combine(trade_date, datetime.min.time())
-    end   = start + timedelta(days=1)
-    df = yf.download(
-        ticker,
-        start=start,
-        end=end,
-        interval="1m",
-        progress=False,
-        auto_adjust=True,
-    )
-    if df.empty:
-        return None
-    # Flatten multi-level columns if present
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    # Zorg dat index timezone-aware is in ET
-    if df.index.tzinfo is None:
-        df.index = df.index.tz_localize("America/New_York")
-    else:
-        df.index = df.index.tz_convert("America/New_York")
-    # Alleen markturen 09:30–16:00
-    df = df.between_time("09:30", "15:59")
-    return df if not df.empty else None
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +306,7 @@ def main() -> None:
 
     data: dict[str, pd.DataFrame | None] = {}
     for setup in WATCHLIST:
-        df = fetch_intraday(setup.ticker, trade_date)
+        df = fetch_1m(setup.ticker, trade_date)
         data[setup.ticker] = df
         status = f"{len(df)} candles" if df is not None else "GEEN DATA"
         print(f"  {setup.ticker:<6} {status}")

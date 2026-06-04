@@ -20,6 +20,7 @@ import zoneinfo
 
 from .paper_client import PaperClient
 from .config import Settings
+from .market_data import orb_avg_volume
 from .notifier import Notifier
 from .parser import Setup
 from .state import ClosedTrade, DayState, Position, StateStore
@@ -336,14 +337,11 @@ class Trader:
                 self._orb_volumes[ticker].append(volume)
                 if bar_num == orb_min:
                     self._orb_done[ticker] = True
-                    logging.info("ORB klaar voor %s (avg vol=%.0f)", ticker,
-                        sum(self._orb_volumes[ticker]) / len(self._orb_volumes[ticker]))
+                    avg = orb_avg_volume(self._orb_volumes[ticker])
+                    logging.info("ORB klaar voor %s (avg vol=%.0f)", ticker, avg or 0)
                 return  # geen trades tijdens ORB window
 
-            orb_avg = (
-                sum(self._orb_volumes[ticker]) / len(self._orb_volumes[ticker])
-                if self._orb_volumes[ticker] else None
-            )
+            orb_avg = orb_avg_volume(self._orb_volumes[ticker])
 
             positions = state.get_positions()
 
