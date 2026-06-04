@@ -12,7 +12,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+from flask import Flask, abort, jsonify, redirect, render_template, request, url_for
 
 from .config import Settings
 from .parser import format_setups, parse_watchlist
@@ -193,6 +193,51 @@ def set_capital():
     store.update_cash(state, amount)
     logging.info("Kapitaal ingesteld op $%.2f", amount)
     return redirect(url_for("index"))
+
+
+@app.route("/history")
+def history():
+    days = []
+    for d in store.list_trade_dates():
+        summary = store.day_summary(d)
+        if summary:
+            days.append(summary)
+    return render_template(
+        "history.html",
+        days=days,
+        today=today().isoformat(),
+        state_dir_hint=settings.state_dir,
+    )
+
+
+@app.route("/history/<date_str>")
+def history_day(date_str: str):
+    try:
+        trade_date = date.fromisoformat(date_str)
+    except ValueError:
+        abort(404)
+    state = store.load_date(trade_date, settings.paper_capital)
+    if state is None:
+        return render_template(
+            "history_day.html",
+            date_str=date_str,
+            trades=[],
+            day_pnl=0.0,
+            cash=0.0,
+            missing=True,
+            today=today().isoformat(),
+        )
+    trades = state.get_closed_trades()
+    day_pnl = sum(t.pnl for t in trades)
+    return render_template(
+        "history_day.html",
+        date_str=date_str,
+        trades=trades,
+        day_pnl=day_pnl,
+        cash=state.cash,
+        missing=False,
+        today=today().isoformat(),
+    )
 
 
 @app.route("/status")

@@ -87,6 +87,38 @@ class StateStore:
     def _file(self, trade_date: date) -> Path:
         return self.path / f"{trade_date.isoformat()}.json"
 
+    def list_trade_dates(self) -> List[date]:
+        """Alle dagen met opgeslagen state (nieuwste eerst)."""
+        dates: List[date] = []
+        for f in self.path.glob("*.json"):
+            try:
+                dates.append(date.fromisoformat(f.stem))
+            except ValueError:
+                continue
+        dates.sort(reverse=True)
+        return dates
+
+    def load_date(self, trade_date: date, start_capital: float = 0.0) -> Optional[DayState]:
+        """Laad state voor een datum; None als er geen bestand is."""
+        if not self._file(trade_date).exists():
+            return None
+        return self.load(trade_date, start_capital)
+
+    def day_summary(self, trade_date: date) -> Optional[dict]:
+        """Samenvatting voor historiek-overzicht."""
+        state = self.load_date(trade_date)
+        if state is None:
+            return None
+        trades = state.closed_trades
+        day_pnl = sum(float(t.get("pnl", 0)) for t in trades)
+        return {
+            "date": trade_date.isoformat(),
+            "trade_count": len(trades),
+            "day_pnl": day_pnl,
+            "cash": state.cash,
+            "open_positions": len(state.positions),
+        }
+
     def load(self, trade_date: date, start_capital: float = 0.0) -> DayState:
         f = self._file(trade_date)
         if not f.exists():

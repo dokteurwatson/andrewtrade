@@ -11,7 +11,7 @@ class Settings:
     tracked_capital:  bool   # IBKR-orders wel, sizing/cash uit state (niet IB $1M)
     max_order_usd:    float  # harde max orderwaarde voor sizing (0 = uit)
     max_shares_per_order: int  # harde max stuks bij sizing (0 = uit)
-    max_order_shares: int  # max stuks per IBKR market order (chunking; 0 = geen limiet)
+    max_order_shares: int  # max stuks per IBKR order (chunking; 0 env → default 500)
     data_source:      str    # "yfinance" of "polygon"
     polygon_api_key:  str    # verplicht bij data_source=polygon
 
@@ -47,6 +47,10 @@ class Settings:
     dashboard_port:    int
     state_dir:         str
     log_level:         str
+
+    def effective_max_order_shares(self) -> int:
+        """Harde limiet per IBKR order (Gateway/TWS). 0 in .env = 500."""
+        return self.max_order_shares if self.max_order_shares > 0 else 500
 
     @staticmethod
     def _parse_market_data_type(raw: str) -> int:

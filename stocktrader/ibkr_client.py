@@ -45,6 +45,11 @@ class IBKRClient:
         self._market_data_type = market_data_type
         self._bar_stream_mode = bar_stream_mode.lower()
         self._max_order_shares = max(0, max_order_shares)
+
+    @property
+    def _order_chunk_size(self) -> int:
+        """Max stuks per placeOrder (IBKR weigert/gecancel grote market orders)."""
+        return self._max_order_shares if self._max_order_shares > 0 else 500
         self._ib        = IB()
         self._bar_subs: Dict[str, object] = {}
         self._mdt_applied = False
@@ -355,21 +360,21 @@ class IBKRClient:
         return " | ".join(parts) if parts else "geen status van IBKR (check Gateway logs)"
 
     def buy_market(self, ticker: str, shares: int) -> str:
-        chunks = self._chunk_shares(shares, self._max_order_shares)
+        chunks = self._chunk_shares(shares, self._order_chunk_size)
         if len(chunks) > 1:
             logging.info(
                 "BUY %s x%d in %d orders (max %d/share/order, IBKR-limiet)",
-                ticker, shares, len(chunks), self._max_order_shares,
+                ticker, shares, len(chunks), self._order_chunk_size,
             )
         timeout = max(60.0, len(chunks) * 10.0)
         return self._run_in_loop(self._place_market_chunks(ticker, "BUY", chunks), timeout=timeout)
 
     def sell_market(self, ticker: str, shares: int) -> str:
-        chunks = self._chunk_shares(shares, self._max_order_shares)
+        chunks = self._chunk_shares(shares, self._order_chunk_size)
         if len(chunks) > 1:
             logging.info(
                 "SELL %s x%d in %d orders (max %d/share/order, IBKR-limiet)",
-                ticker, shares, len(chunks), self._max_order_shares,
+                ticker, shares, len(chunks), self._order_chunk_size,
             )
         timeout = max(60.0, len(chunks) * 10.0)
         return self._run_in_loop(self._place_market_chunks(ticker, "SELL", chunks), timeout=timeout)
@@ -385,6 +390,7 @@ class IBKRClient:
         order_ids: List[str] = []
         n = len(chunks)
         for i, qty in enumerate(chunks, start=1):
+            qty = min(qty, self._order_chunk_size)
             order = MarketOrder(side, qty)
             trade = self._ib.placeOrder(c, order)
             for _ in range(25):
@@ -408,16 +414,24 @@ class IBKRClient:
         return ",".join(order_ids)
 
     def close_all_positions(self) -> None:
+        """Sluit posities in chunks (zelfde limiet als buy/sell_market)."""
+
         async def _close():
             positions = self._ib.positions()
             for pos in positions:
                 if pos.position == 0:
                     continue
-                side  = "SELL" if pos.position > 0 else "BUY"
-                qty   = abs(int(pos.position))
-                order = MarketOrder(side, qty)
-                self._ib.placeOrder(pos.contract, order)
-                logging.info("EOD close: %s %s x%d", side, pos.contract.symbol, qty)
+                sym = pos.contract.symbol
+                side = "SELL" if pos.position > 0 else "BUY"
+                qty = abs(int(pos.position))
+                chunks = self._chunk_shares(qty, self._order_chunk_size)
+                for i, part in enumerate(chunks, start=1):
+                    order = MarketOrder(side, part)
+                    self._ib.placeOrder(pos.contract, order)
+                    logging.info(
+                        "EOD close: %s %s x%d (%d/%d)", side, sym, part, i, len(chunks),
+                    )
+                    await asyncio.sleep(0.35)
             logging.info("Alle posities gesloten (EOD).")
 
         self._run_in_loop(_close())

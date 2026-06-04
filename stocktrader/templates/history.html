@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Historiek — Stocktrader</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; padding: 24px; }
+    h1 { color: #00ff88; margin-bottom: 4px; font-size: 1.4rem; }
+    .subtitle { color: #666; font-size: 0.8rem; margin-bottom: 24px; }
+    .nav { margin-bottom: 20px; }
+    .nav a { color: #00ff88; text-decoration: none; font-size: 0.85rem; }
+    .nav a:hover { text-decoration: underline; }
+    .card { background: #161616; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; max-width: 720px; }
+    .card h2 { color: #aaa; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    th { color: #666; text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a2a2a; font-weight: normal; text-transform: uppercase; font-size: 0.7rem; }
+    td { padding: 6px 8px; border-bottom: 1px solid #1a1a1a; }
+    tr:hover td { background: #1e1e1e; }
+    a.day-link { color: #00ff88; text-decoration: none; font-weight: bold; }
+    a.day-link:hover { text-decoration: underline; }
+    .green { color: #00ff88; }
+    .red { color: #ff4444; }
+    .hint { color: #555; font-size: 0.75rem; margin-top: 12px; }
+  </style>
+</head>
+<body>
+
+<p class="nav"><a href="{{ url_for('index') }}">← Vandaag</a></p>
+
+<h1>Trade historiek</h1>
+<p class="subtitle">Gesloten trades per dag ({{ state_dir_hint }})</p>
+
+<div class="card">
+  <h2>Dagen</h2>
+  {% if days %}
+  <table>
+    <tr>
+      <th>Datum</th>
+      <th>Trades</th>
+      <th>Dag PnL</th>
+      <th>Cash (eind)</th>
+      <th>Open</th>
+    </tr>
+    {% for d in days %}
+    <tr>
+      <td>
+        <a class="day-link" href="{{ url_for('history_day', date_str=d.date) }}">{{ d.date }}</a>
+        {% if d.date == today %}<span style="color:#666;font-size:0.7rem;"> vandaag</span>{% endif %}
+      </td>
+      <td>{{ d.trade_count }}</td>
+      <td class="{% if d.day_pnl > 0 %}green{% elif d.day_pnl < 0 %}red{% endif %}">
+        ${{ "%+.2f"|format(d.day_pnl) }}
+      </td>
+      <td>${{ "%.2f"|format(d.cash) }}</td>
+      <td>{{ d.open_positions }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p style="color:#555; font-size:0.85rem;">Nog geen opgeslagen dagen. Na je eerste trades staat hier elke dag met een state-bestand.</p>
+  {% endif %}
+  <p class="hint">Data: JSON per dag in STATE_DIR (in k8s vaak /data op de PVC).</p>
+</div>
+
+</body>
+</html>

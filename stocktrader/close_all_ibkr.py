@@ -69,6 +69,17 @@ def _round_price(price: float) -> float:
     return max(0.0001, round(price, 6))
 
 
+def _resolve_chunk_size(cli_chunk: int) -> int:
+    """MAX_ORDER_SHARES uit env (default 500); --chunk mag niet hoger."""
+    lim = Settings.from_env().effective_max_order_shares()
+    if cli_chunk <= 0:
+        return lim
+    if cli_chunk > lim:
+        log.warning("--chunk %d > MAX_ORDER_SHARES %d, gebruik %d", cli_chunk, lim, lim)
+        return lim
+    return cli_chunk
+
+
 def _chunk_qty(remaining: int, chunk_size: int) -> int:
     return min(remaining, chunk_size) if chunk_size > 0 else remaining
 
@@ -270,8 +281,7 @@ async def run(
     host = os.getenv("IBKR_HOST", "ib-gateway")
     port = int(os.getenv("IBKR_PORT", "4002"))
     client_id = int(os.getenv("IBKR_CLOSE_CLIENT_ID", "2"))
-    if chunk_size <= 0:
-        chunk_size = int(os.getenv("MAX_ORDER_SHARES", "500"))
+    chunk_size = _resolve_chunk_size(chunk_size)
 
     util.logToFile(f"close_all_ibkr_client_{client_id}.log")
     util.logToConsole(logging.WARNING)
@@ -327,12 +337,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--timeout", type=float, default=120.0, help="Sec wachten per chunk")
-    parser.add_argument("--chunk", type=int, default=500, help="Stuks per order (default 500)")
+    parser.add_argument(
+        "--chunk",
+        type=int,
+        default=0,
+        help="Stuks per order (0 = MAX_ORDER_SHARES uit env, default 500)",
+    )
     parser.add_argument("--symbol", action="append", dest="symbols")
     args = parser.parse_args(argv)
 
     if not args.dry_run and not args.yes and sys.stdin.isatty():
-        print(f"Verkoopt alles in chunks van {args.chunk} (verlies OK).")
+        print(f"Verkoopt alles in chunks van {_resolve_chunk_size(args.chunk)} (verlies OK).")
         if input("Doorgaan? [y/N] ").strip().lower() != "y":
             return 0
 
@@ -341,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         run(
             dry_run=args.dry_run,
             order_timeout_sec=args.timeout,
-            chunk_size=args.chunk,
+            chunk_size=_resolve_chunk_size(args.chunk),
             symbols_filter=args.symbols,
         )
     )
