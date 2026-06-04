@@ -86,6 +86,7 @@ class IBKRClient:
         self._loop_ready = threading.Event()
         self._cached_cash: float = 0.0
         self._cached_balances: Dict[str, float] = {}
+        self._cached_positions: Dict[str, dict] = {}
         self._trading_currency: str = TRADING_CASH_CURRENCY
         util.logToConsole(logging.WARNING)
         # ib_insync bar handlers draaien op de event-loop; strategie niet synchroon daar
@@ -162,6 +163,7 @@ class IBKRClient:
                             list({(v.tag, v.currency) for v in vals})[:12],
                         )
 
+                    await self._refresh_positions_cache()
                     await asyncio.sleep(30)
 
                 except Exception as exc:
@@ -206,13 +208,16 @@ class IBKRClient:
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Wordt automatisch opgeroepen door de achtergrond-thread.
-        Handmatige aanroep wacht tot de achtergrond-thread verbonden is."""
+        """Wacht tot achtergrond-thread verbonden is en account-data gecached."""
         deadline = time.time() + 30
-        while not self._ib.isConnected() and time.time() < deadline:
+        while time.time() < deadline:
+            if self._ib.isConnected() and self._cached_balances:
+                return
             time.sleep(0.5)
         if not self._ib.isConnected():
             raise TimeoutError("IBKR verbinding time-out")
+        if not self._cached_balances:
+            raise TimeoutError("IBKR account-data time-out")
 
     def disconnect(self) -> None:
         self._ib.disconnect()
@@ -244,14 +249,12 @@ class IBKRClient:
                 return float(v.value)
         return self._cached_cash
 
-    def get_stock_positions(self) -> Dict[str, dict]:
-        """Open US-aandelenposities bij IBKR: symbol → shares, avg_cost, side."""
-
-        async def _fetch():
-            if self._ib.isConnected():
-                self._ib.reqPositions()
-                await asyncio.sleep(1)
-            out: Dict[str, dict] = {}
+    async def _refresh_positions_cache(self) -> None:
+        """Alleen op IB-event-loop thread — geen Flask/asyncio-conflict."""
+        out: Dict[str, dict] = {}
+        if self._ib.isConnected():
+            self._ib.reqPositions()
+            await asyncio.sleep(1)
             for pos in self._ib.positions():
                 c = pos.contract
                 if getattr(c, "secType", "") != "STK":
@@ -268,9 +271,13 @@ class IBKRClient:
                     "side": "long" if qty > 0 else "short",
                     "avg_cost": avg,
                 }
-            return out
+        with self._lock:
+            self._cached_positions = out
 
-        return self._run_in_loop(_fetch(), timeout=20)
+    def get_stock_positions(self) -> Dict[str, dict]:
+        """Open US-aandelenposities (cache, ververst door achtergrond-loop)."""
+        with self._lock:
+            return dict(self._cached_positions)
 
     # ------------------------------------------------------------------
     # OTC / MiFID II filter

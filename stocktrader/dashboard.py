@@ -48,6 +48,7 @@ def ibkr_cash_info() -> dict:
             return {}
         return {
             "balances": balances,
+            "balance_rows": sorted(balances.items()),
             "trading_amount": amount,
             "trading_currency": currency,
         }

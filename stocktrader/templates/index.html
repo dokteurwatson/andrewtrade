@@ -78,8 +78,8 @@
     <div class="stat-label">{% if paper_mode or tracked_capital %}Bot kapitaal{% else %}IBKR cash{% endif %}</div>
     <div class="stat-value green" style="font-size:{% if ibkr_cash and ibkr_cash.balances|length > 1 %}0.95{% else %}1.3{% endif %}rem;">
       {% if ibkr_cash and ibkr_cash.balances %}
-        {% for cur in ibkr_cash.balances|dictsort %}
-        <div>{{ cur }} {{ "%.2f"|format(ibkr_cash.balances[cur]) }}</div>
+        {% for cur, amount in ibkr_cash.balance_rows %}
+        <div>{{ cur }} {{ "%.2f"|format(amount) }}</div>
         {% endfor %}
       {% else %}
         ${{ "%.2f"|format(state.cash) }}
@@ -134,11 +134,11 @@
     <h2>Account (IBKR)</h2>
     <div style="display:flex; gap:32px; flex-wrap:wrap; align-items:baseline;">
       {% if ibkr_cash and ibkr_cash.balances %}
-      {% for cur in ibkr_cash.balances|dictsort %}
+      {% for cur, amount in ibkr_cash.balance_rows %}
       <div>
         <div style="color:#666; font-size:0.7rem; text-transform:uppercase;">Cash {{ cur }}</div>
         <div style="font-size:1.5rem; font-weight:bold; color:#00ff88; margin-top:4px;">
-          {{ cur }} {{ "%.2f"|format(ibkr_cash.balances[cur]) }}
+          {{ cur }} {{ "%.2f"|format(amount) }}
         </div>
       </div>
       {% endfor %}
@@ -178,7 +178,7 @@
       {% if ibkr_connected %}<span class="green">● Verbonden</span>{% else %}<span class="red">● Niet verbonden</span>{% endif %}
       {% if ibkr_cash and ibkr_cash.balances and tracked_capital %}
       <span style="color:#666; margin-left:16px;">IB-wallet:
-        {% for cur in ibkr_cash.balances|dictsort %}{{ cur }} {{ "%.2f"|format(ibkr_cash.balances[cur]) }}{% if not loop.last %}, {% endif %}{% endfor %}
+        {% for cur, amount in ibkr_cash.balance_rows %}{{ cur }} {{ "%.2f"|format(amount) }}{% if not loop.last %}, {% endif %}{% endfor %}
       </span>
       {% endif %}
     </div>
