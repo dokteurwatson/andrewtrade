@@ -77,6 +77,7 @@ def run_scenario(
     scenario: str,
     orb_minutes: int,
     capital: float,
+    fee_pct: float = 0.0015,
 ) -> list[TradeResult]:
     """
     Portfolio-simulator: één cash pool voor alle tickers.
@@ -157,7 +158,8 @@ def run_scenario(
 
             if breaks_level and above_orb and vol_ok:
                 spend = shares * setup.break_
-                cash -= spend
+                buy_fee = spend * fee_pct
+                cash -= spend + buy_fee
                 vol_mult = (volume / orb_avg_vol) if orb_avg_vol and orb_avg_vol > 0 else None
                 positions[ticker] = {
                     "entry_price": setup.break_,
@@ -171,9 +173,12 @@ def run_scenario(
 
             def close_position(exit_price: float, exit_time: str, reason: str) -> None:
                 nonlocal cash
-                pnl = (exit_price - pos["entry_price"]) * pos["shares"]
                 proceeds = exit_price * pos["shares"]
-                cash += proceeds
+                sell_fee = proceeds * fee_pct
+                buy_fee  = pos["spend"] * fee_pct
+                total_fees = buy_fee + sell_fee
+                pnl = (exit_price - pos["entry_price"]) * pos["shares"] - total_fees
+                cash += proceeds - sell_fee
                 results_map[ticker] = TradeResult(
                     ticker=ticker, scenario=scenario,
                     entry_price=pos["entry_price"], entry_time=pos["entry_time"],
@@ -196,7 +201,11 @@ def run_scenario(
         if df is not None and not df.empty:
             exit_price = float(df.iloc[-1]["Close"])
             exit_time  = df.index[-1].strftime("%H:%M")
-            pnl = (exit_price - pos["entry_price"]) * pos["shares"]
+            proceeds   = exit_price * pos["shares"]
+            sell_fee   = proceeds * fee_pct
+            buy_fee    = pos["spend"] * fee_pct
+            total_fees = buy_fee + sell_fee
+            pnl = (exit_price - pos["entry_price"]) * pos["shares"] - total_fees
             orb_high, _ = orb_stats[ticker]
             results_map[ticker] = TradeResult(
                 ticker=ticker, scenario=scenario,
@@ -295,12 +304,14 @@ def last_trading_day() -> date:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Penny stock watchlist backtest")
-    parser.add_argument("--date",    type=str,   default=None,  help="YYYY-MM-DD (default: gisteren)")
-    parser.add_argument("--capital", type=float, default=50.0,  help="Kapitaal per trade in USD")
+    parser.add_argument("--date",    type=str,   default=None,   help="YYYY-MM-DD (default: gisteren)")
+    parser.add_argument("--capital", type=float, default=50.0,   help="Startkapitaal in USD")
+    parser.add_argument("--fee",     type=float, default=0.0015, help="Fee per transactie (bijv. 0.0015 = 0.15%%)")
     args = parser.parse_args()
 
     trade_date = date.fromisoformat(args.date) if args.date else last_trading_day()
-    print(f"\nWatchlist backtest — {trade_date}  |  Kapitaal per trade: ${args.capital:.0f}")
+    fee_pct = args.fee
+    print(f"\nWatchlist backtest — {trade_date}  |  Kapitaal: ${args.capital:.0f}  |  Fee: {fee_pct*100:.2f}% p/zijde ({fee_pct*200:.2f}% round-trip)")
     print(f"Tickers: {', '.join(s.ticker for s in WATCHLIST)}")
     print(f"\nData ophalen...")
 
@@ -320,7 +331,7 @@ def main() -> None:
     all_results: dict[str, list[TradeResult]] = {}
 
     for label, orb_min in SCENARIOS:
-        results = run_scenario(WATCHLIST, data, label, orb_min, args.capital)
+        results = run_scenario(WATCHLIST, data, label, orb_min, args.capital, fee_pct)
         all_results[label] = results
         print_scenario_report(results, label, args.capital)
 

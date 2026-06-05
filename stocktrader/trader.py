@@ -81,6 +81,7 @@ class Trader:
         self._lock = threading.Lock()
 
         self._orb_volumes: Dict[str, List[float]] = defaultdict(list)
+        self._orb_highs: Dict[str, float] = {}
         self._orb_done: Dict[str, bool] = {}
         self._bar_count: Dict[str, int] = defaultdict(int)
 
@@ -319,13 +320,18 @@ class Trader:
             orb_min = self.settings.orb_minutes
             if orb_min > 0 and bar_num <= orb_min:
                 self._orb_volumes[ticker].append(volume)
+                self._orb_highs[ticker] = max(self._orb_highs.get(ticker, 0.0), high)
                 if bar_num == orb_min:
                     self._orb_done[ticker] = True
                     avg = orb_avg_volume(self._orb_volumes[ticker])
-                    logging.info("ORB klaar voor %s (avg vol=%.0f)", ticker, avg or 0)
+                    logging.info(
+                        "ORB klaar voor %s (avg vol=%.0f, high=%.4f)",
+                        ticker, avg or 0, self._orb_highs[ticker],
+                    )
                 return
 
             orb_avg = orb_avg_volume(self._orb_volumes[ticker])
+            orb_high = self._orb_highs.get(ticker)  # None als ORB_MINUTES=0
             positions = state.get_positions()
 
             if not is_new_bar:
@@ -355,12 +361,15 @@ class Trader:
                 or orb_avg == 0
                 or volume >= self.settings.volume_mult * orb_avg
             )
+            # ORB high prijscheck: alleen actief als ORB_MINUTES > 0
+            above_orb_high = orb_high is None or high >= orb_high
 
-            if high >= setup.break_:
+            if high >= setup.break_ and above_orb_high:
                 if vol_ok:
+                    orb_info = f" | orb_high={orb_high:.4f}" if orb_high else ""
                     logging.info(
-                        "BREAKOUT %s | high=%.4f >= break=%.4f | vol=%.0f",
-                        ticker, high, setup.break_, volume,
+                        "BREAKOUT %s | high=%.4f >= break=%.4f | vol=%.0f%s",
+                        ticker, high, setup.break_, volume, orb_info,
                     )
                     self._enter(state, setup)
                 else:
@@ -368,6 +377,11 @@ class Trader:
                         "BREAKOUT %s volume te laag | vol=%.0f need>=%.0f",
                         ticker, volume, (self.settings.volume_mult * orb_avg) if orb_avg else 0,
                     )
+            elif high >= setup.break_ and not above_orb_high:
+                logging.debug(
+                    "BREAKOUT %s prijs onder ORB high | high=%.4f < orb_high=%.4f",
+                    ticker, high, orb_high,
+                )
 
     def _portfolio_cash(self, state: DayState) -> float:
         return self.client.get_cash()
