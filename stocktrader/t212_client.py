@@ -224,6 +224,12 @@ class T212Client:
             return self._account_cache.currency
         return self.get_account_info().currency
 
+    def get_account_currency_cached(self, default: str = "EUR") -> str:
+        """Alleen cache — geen API (veilig voor dashboard request-path)."""
+        if self._account_cache is not None:
+            return self._account_cache.currency
+        return default
+
     def cash_in_usd(self, amount: float, *, currency: Optional[str] = None) -> float:
         """
         Schatting: account-saldo → USD voor share-count vóór de order.

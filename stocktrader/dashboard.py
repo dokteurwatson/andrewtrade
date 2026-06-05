@@ -198,15 +198,8 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
 
     is_paper_broker = settings.effective_broker() == "paper"
     account_currency = "USD"
-    if (
-        engine_live
-        and settings.effective_broker() == "t212"
-        and isinstance(trader.client, T212Client)
-    ):
-        try:
-            account_currency = trader.client.get_account_currency()
-        except Exception:
-            pass
+    if settings.effective_broker() == "t212" and isinstance(trader.client, T212Client):
+        account_currency = trader.client.get_account_currency_cached(default="EUR")
     account_currency_symbol = currency_symbol(account_currency)
 
     return dict(
@@ -240,7 +233,8 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
 @app.route("/")
 def index():
     warn = [t.strip().upper() for t in request.args.get("warn_blocked", "").split(",") if t.strip()]
-    ctx = _render_ctx(load_state(), warn_blocked=warn)
+    # Geen T212/FX op page load — voorkomt hang bij parallel trader-start.
+    ctx = _render_ctx(load_state(refresh_cash=False), warn_blocked=warn)
     skipped = request.args.get("warn_skipped")
     if skipped and skipped.isdigit():
         ctx["warn_skipped"] = int(skipped)

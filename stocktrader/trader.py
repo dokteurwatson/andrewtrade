@@ -27,7 +27,7 @@ import zoneinfo
 from .bar_stream import build_bar_stream
 from .config import Settings
 from .market_data import ET, orb_avg_volume
-from .market_snapshot import build_quote_row
+from .market_snapshot import build_quote_row, quote_status
 from .notifier import Notifier
 from .parser import Setup
 from .state import ClosedTrade, DayState, Position, StateStore
@@ -39,6 +39,9 @@ MARKET_CLOSE_H = 15
 MARKET_CLOSE_M = 55
 
 _DATA_STALE_BLOCK_FACTOR = 2  # blokkeer na 2× stale_bar_seconds zonder bar
+_HEARTBEAT_INTERVAL_SEC = 60
+_BAR_HEALTH_INTERVAL_SEC = 120
+_STALE_GRACE_MIN_SEC = 180  # eerste stale-waarschuwing (niet 10 min wachten)
 
 # Order queue item types
 _OrderAction = Tuple[str, ...]  # ("ENTER", setup) | ("EXIT", pos, exit_price, reason)
@@ -364,12 +367,15 @@ class Trader:
         stale_sec = self.settings.stale_bar_seconds()
         block_sec = stale_sec * _DATA_STALE_BLOCK_FACTOR
         _stale_warned: Set[str] = set()
-        _STALE_GRACE_SEC = max(600, stale_sec)
+        _STALE_GRACE_SEC = max(_STALE_GRACE_MIN_SEC, stale_sec)
 
         logging.info(
-            "Trader monitor-loop actief | %d tickers | stale-waarschuwing na %ds | "
-            "bar-health elke 5m",
-            len(tickers), _STALE_GRACE_SEC,
+            "Trader monitor-loop actief | %d tickers | heartbeat elke %ds | "
+            "bar-health elke %ds | stale na %ds",
+            len(tickers),
+            _HEARTBEAT_INTERVAL_SEC,
+            _BAR_HEALTH_INTERVAL_SEC,
+            _STALE_GRACE_SEC,
         )
 
         # Start order worker thread
@@ -390,11 +396,11 @@ class Trader:
                 now_mono = time.monotonic()
                 uptime = now_mono - self._engine_started_at
 
-                if now_mono - self._last_bar_health_log >= 300:
+                if now_mono - self._last_bar_health_log >= _BAR_HEALTH_INTERVAL_SEC:
                     self._log_bar_health(tickers, stale_sec, data_src)
                     self._last_bar_health_log = now_mono
 
-                if now_mono - self._last_heartbeat_log >= 300:
+                if now_mono - self._last_heartbeat_log >= _HEARTBEAT_INTERVAL_SEC:
                     with self._lock:
                         n_bars = self._bars_received
                         n_last = len(self._last_bar)
@@ -567,14 +573,29 @@ class Trader:
                 blocked=(ticker in self._data_blocked),
                 bar_time=bar_time,
             )
-            with self._lock:
-                self._quote_snapshots[ticker] = quote_row
+            self._quote_snapshots[ticker] = quote_row
+
+            status = quote_status(
+                setup,
+                self.settings,
+                high=high,
+                close=close,
+                volume=volume,
+                orb_avg=orb_avg,
+                orb_high=orb_high,
+                bar_num=bar_num,
+                blocked=(ticker in self._data_blocked),
+            )
+            logging.info(
+                "BAR %s #%d %s H=%.4f C=%.4f V=%.0f break=%.4f [%s]",
+                ticker, bar_num, bar_time, high, close, volume, setup.break_, status,
+            )
 
             if not is_new_bar:
                 return
 
             if ticker in self._data_blocked:
-                logging.debug("BAR %s overgeslagen — data geblokkeerd.", ticker)
+                logging.info("BAR %s overgeslagen — data geblokkeerd.", ticker)
                 return
 
             if ticker in positions:
@@ -612,7 +633,7 @@ class Trader:
                         ticker, volume, (self.settings.volume_mult * orb_avg) if orb_avg else 0,
                     )
             elif high >= setup.break_ and not above_orb_high:
-                logging.debug(
+                logging.info(
                     "BREAKOUT %s prijs onder ORB high | high=%.4f < orb_high=%.4f",
                     ticker, high, orb_high,
                 )
@@ -717,7 +738,10 @@ class Trader:
             mode = "ALL-IN"
 
         if shares < 1:
-            logging.warning("Onvoldoende cash voor %s.", setup.ticker)
+            logging.warning(
+                "Onvoldoende cash voor %s (cash_usd=%.2f, size_price=%.4f).",
+                setup.ticker, cash_usd, size_price,
+            )
             return
 
         if shares * size_price > cash_usd * (1 - s.cash_reserve_pct):
@@ -727,6 +751,10 @@ class Trader:
 
         shares = self._cap_shares(shares, size_price)
         if shares < 1:
+            logging.warning(
+                "Orderlimiet blokkeert %s (shares=0 na cap, size_price=%.4f).",
+                setup.ticker, size_price,
+            )
             return
 
         logging.info("ENTRY %s x%d @~%.4f [%s]", setup.ticker, shares, size_price, mode)
