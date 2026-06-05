@@ -75,7 +75,16 @@ def today() -> date:
 
 def load_state() -> DayState:
     state = store.load(today(), settings.paper_capital)
-    if state.cash <= 0:
+    if settings.effective_broker() == "t212":
+        try:
+            actual_cash = trader.client.get_cash()
+            if actual_cash > 0:
+                store.update_cash(state, actual_cash)
+        except Exception as exc:
+            logging.warning("T212 cash ophalen mislukt: %s", exc)
+            if state.cash <= 0:
+                store.update_cash(state, settings.paper_capital)
+    elif state.cash <= 0:
         store.update_cash(state, settings.paper_capital)
     return state
 
