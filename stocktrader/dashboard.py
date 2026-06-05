@@ -396,7 +396,12 @@ def status():
 
 @app.get("/health")
 def health():
-    # Geen T212 API-call op elke k8s probe — voorkomt log-spam en rate limits
+    """K8s liveness/readiness — altijd 200 zolang Flask draait.
+
+    De trading-engine kan uit staan (AUTO_RESUME=false, handmatige stop);
+    het dashboard moet dan nog bereikbaar blijven. Gebruik /status voor
+    engine-state en monitoring.
+    """
     state = load_state(refresh_cash=False)
     engine_live = trader.is_engine_live()
     issues = []
@@ -404,13 +409,11 @@ def health():
         issues.append("engine_crashed")
     elif state.active and not engine_live:
         issues.append("engine_not_running")
-    if issues:
-        return jsonify({
-            "status": "degraded",
-            "issues": issues,
-            "engine_live": engine_live,
-        }), 503
-    return jsonify({"status": "ok", "engine_live": engine_live})
+    return jsonify({
+        "status": "degraded" if issues else "ok",
+        "issues": issues,
+        "engine_live": engine_live,
+    })
 
 
 if __name__ == "__main__":
