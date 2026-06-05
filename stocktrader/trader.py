@@ -695,16 +695,32 @@ class Trader:
 
         if not isinstance(self.client, T212Client):
             return
-        try:
-            cash = self.client.get_cash(force=True)
-            if cash >= 0:
-                self.store.update_cash(state, cash)
-                suffix = f" ({label})" if label else ""
-                ccy = self.client.get_account_currency_cached()
-                logging.info("Cash bijgewerkt%s: %.2f %s", suffix, cash, ccy)
-        except (T212RateLimitError, T212NetworkError) as exc:
-            suffix = f" ({label})" if label else ""
-            logging.warning("Cash sync mislukt%s: %s", suffix, exc)
+        suffix = f" ({label})" if label else ""
+        # Account summary: T212 rate limit 1 req / 5s — wacht en retry na orders.
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    time.sleep(5.5)
+                cash = self.client.get_cash(force=True)
+                if cash >= 0:
+                    self.store.update_cash(state, cash)
+                    ccy = self.client.get_account_currency_cached()
+                    logging.info("Cash bijgewerkt%s: %.2f %s", suffix, cash, ccy)
+                return
+            except T212RateLimitError as exc:
+                if attempt < 2:
+                    wait = exc.retry_after or 5.5
+                    logging.info(
+                        "Cash sync rate limit%s — retry over %.1fs (poging %d/3)",
+                        suffix, wait, attempt + 1,
+                    )
+                    time.sleep(wait)
+                    continue
+                logging.warning("Cash sync mislukt%s: %s", suffix, exc)
+                return
+            except T212NetworkError as exc:
+                logging.warning("Cash sync mislukt%s: %s", suffix, exc)
+                return
 
     def _cash_for_usd_sizing(self, cash: float) -> float:
         """Account-cash omgerekend naar USD voor vergelijking met US-aandeelprijzen."""

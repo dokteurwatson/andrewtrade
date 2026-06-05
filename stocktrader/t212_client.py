@@ -197,7 +197,8 @@ class T212Client:
     def _parse_account_summary(self, data: dict) -> T212AccountInfo:
         cash_block = data.get("cash", data)
         cash = 0.0
-        for field in ("free", "availableToTrade", "freeForStocks"):
+        # availableToTrade = werkelijk vrij om te handelen; "free" kan te hoog zijn
+        for field in ("availableToTrade", "freeForStocks", "free"):
             val = cash_block.get(field)
             if val is not None:
                 cash = float(val)

@@ -138,12 +138,17 @@ def today() -> date:
 
 def load_state(*, refresh_cash: bool = True) -> DayState:
     state = store.load(today(), settings.paper_capital)
-    # Geen T212 API op page load — voorkomt blokkeren van single-thread Flask.
-    if refresh_cash and settings.effective_broker() == "t212" and trader.is_engine_live():
+    if refresh_cash and settings.effective_broker() == "t212":
         try:
-            actual_cash = trader.client.get_cash()
-            if actual_cash >= 0:
-                store.update_cash(state, actual_cash)
+            from .t212_client import T212Client, T212RateLimitError
+
+            if isinstance(trader.client, T212Client):
+                trader.client._ensure_connected()
+                actual_cash = trader.client.get_cash(force=True)
+                if actual_cash >= 0:
+                    store.update_cash(state, actual_cash)
+        except T212RateLimitError:
+            logging.debug("T212 cash refresh overgeslagen — rate limit.")
         except Exception as exc:
             logging.warning("T212 cash ophalen mislukt: %s", exc)
     elif state.cash <= 0:
@@ -234,7 +239,7 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
 def index():
     warn = [t.strip().upper() for t in request.args.get("warn_blocked", "").split(",") if t.strip()]
     # Geen T212/FX op page load — voorkomt hang bij parallel trader-start.
-    ctx = _render_ctx(load_state(refresh_cash=False), warn_blocked=warn)
+    ctx = _render_ctx(load_state(refresh_cash=True), warn_blocked=warn)
     skipped = request.args.get("warn_skipped")
     if skipped and skipped.isdigit():
         ctx["warn_skipped"] = int(skipped)

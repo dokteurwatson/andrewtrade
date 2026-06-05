@@ -124,6 +124,15 @@ def test_get_cash_availableToTrade_fallback():
     assert c.get_cash() == pytest.approx(999.0)
 
 
+def test_get_cash_prefers_available_to_trade_over_free():
+    c = _connected_client()
+    c._get = MagicMock(return_value={
+        "currency": "EUR",
+        "cash": {"free": 100.0, "availableToTrade": 92.15},
+    })
+    assert c.get_cash() == pytest.approx(92.15)
+
+
 def test_get_cash_raises_on_auth_error():
     c = _connected_client()
     c._get = MagicMock(side_effect=T212AuthError("HTTP 401"))
