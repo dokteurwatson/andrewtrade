@@ -1,12 +1,17 @@
 """
 Hoofdtrading loop — strategie uitvoering.
 
+Modes (gestuurd via .env):
+  BROKER=paper  + DATA_SOURCE=yfinance|polygon|alpaca → volledig gesimuleerd
+  BROKER=t212   + DATA_SOURCE=alpaca                  → Alpaca data, T212 demo/live orders
+  BROKER=t212   + T212_DEMO=true                      → T212 demo (geen echt geld)
+  BROKER=t212   + T212_DEMO=false                     → T212 live (echt geld)
+
 Flow per dag:
-  09:30 ET → stream start, ORB window opbouwen
-  Na ORB   → breakout signalen detecteren, orders plaatsen
+  09:30 ET → bar-stream start, ORB window opbouwen
+  Na ORB   → breakout signalen, orders via actieve broker
   Continu  → stop-loss en target bewaken
-  15:55 ET → alle posities sluiten (EOD)
-  15:59 ET → stream stoppen
+  15:55 ET → EOD flatten
 """
 from __future__ import annotations
 
@@ -14,11 +19,11 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Dict, List, Optional, Set
 import zoneinfo
 
-from .paper_client import PaperClient
+from .bar_stream import build_bar_stream
 from .config import Settings
 from .market_data import orb_avg_volume
 from .notifier import Notifier
@@ -29,79 +34,76 @@ ET = zoneinfo.ZoneInfo("America/New_York")
 MARKET_OPEN_H  = 9
 MARKET_OPEN_M  = 30
 MARKET_CLOSE_H = 15
-MARKET_CLOSE_M = 55   # 4 minuten voor sluit → EOD exit
+MARKET_CLOSE_M = 55
+
+_DATA_STALE_BLOCK_FACTOR = 2  # blokkeer na 2× stale_bar_seconds zonder bar
+
+
+def _build_broker_client(settings: Settings):
+    """Maak de juiste broker-client op basis van BROKER-setting."""
+    broker = settings.effective_broker()
+
+    if broker == "t212":
+        from .t212_client import T212Client
+        return T212Client(
+            api_key=settings.t212_api_key,
+            api_secret=settings.t212_api_secret,
+            demo=settings.t212_demo,
+        )
+
+    # paper (default)
+    from .paper_client import PaperClient
+    return PaperClient(
+        start_capital=settings.paper_capital,
+        poll_seconds=settings.bar_poll_seconds,
+    )
 
 
 class Trader:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.client = _build_broker_client(settings)
+        self._bar_stream = build_bar_stream(settings)
 
-        if settings.paper_mode:
-            self.ibkr = PaperClient(
-                start_capital=settings.paper_capital,
-                data_source=settings.data_source,
-                polygon_api_key=settings.polygon_api_key,
-            )
-            logging.info("Paper mode actief (data=%s, kapitaal=$%.2f)", settings.data_source, settings.paper_capital)
-        else:
-            from .ibkr_client import IBKRClient   # lazy import — vereist ib_insync
-            self.ibkr = IBKRClient(
-                settings.ibkr_host,
-                settings.ibkr_port,
-                settings.ibkr_client_id,
-                otc_filter_enabled=settings.otc_filter_enabled,
-                market_data_type=settings.ibkr_market_data_type,
-                bar_stream_mode=settings.ibkr_bar_stream,
-                max_order_shares=settings.max_order_shares,
-            )
-            if settings.tracked_capital:
-                logging.info(
-                    "IBKR live orders | tracked kapitaal=$%.2f (IB-saldo genegeerd voor sizing)",
-                    settings.paper_capital,
-                )
-            else:
-                logging.info("Live mode actief (IBKR %s:%d)", settings.ibkr_host, settings.ibkr_port)
-        self.notifier  = Notifier(
+        broker_label = settings.effective_broker().upper()
+        data_label   = settings.effective_data_source()
+        logging.info(
+            "Trader init | broker=%s | data=%s | poll=%ds",
+            broker_label, data_label, settings.bar_poll_seconds,
+        )
+
+        self.notifier = Notifier(
             settings.telegram_enabled,
             settings.telegram_token,
             settings.telegram_chat_id,
         )
-        self.store     = StateStore(settings.state_dir)
-        self._lock     = threading.Lock()
+        self.store = StateStore(settings.state_dir)
+        self._lock = threading.Lock()
 
-        # ORB state per ticker: lijst van volumes tijdens ORB window
         self._orb_volumes: Dict[str, List[float]] = defaultdict(list)
-        self._orb_done:    Dict[str, bool]         = {}
-        self._bar_count:   Dict[str, int]          = defaultdict(int)
+        self._orb_done: Dict[str, bool] = {}
+        self._bar_count: Dict[str, int] = defaultdict(int)
 
         self._state: Optional[DayState] = None
         self._running = False
         self._engine_live = False
         self._loop_thread: Optional[threading.Thread] = None
-        self._last_bar: Dict[str, float] = {}  # ticker → time.monotonic() van laatste bar
-
-    # ------------------------------------------------------------------
-    # Publieke interface
-    # ------------------------------------------------------------------
+        self._last_bar: Dict[str, float] = {}
+        self._data_blocked: Set[str] = set()  # tickers tijdelijk geblokkeerd wegens stale data
+        self._engine_started_at: float = 0.0
+        self._last_bar_health_log: float = 0.0
 
     def load_day(self, state: DayState) -> None:
-        """Laad de dagstate (wordt aangeroepen door dashboard na upload)."""
         with self._lock:
             self._state = state
-            # Koppel cash persistentie in paper mode
-            if self.settings.paper_mode and isinstance(self.ibkr, PaperClient):
-                self.ibkr.bind_state(self.store, state)
-            elif self.settings.tracked_capital and state.cash <= 0:
-                self.store.update_cash(state, self.settings.paper_capital)
+            self.client.bind_state(self.store, state)
         logging.info("Dagstate geladen: %d setups", len(state.setups))
 
     def is_engine_live(self) -> bool:
-        """True als de trading-loop draait en bar-stream actief is (niet alleen state.active)."""
         t = self._loop_thread
         return self._engine_live and t is not None and t.is_alive()
 
     def start(self, state: DayState) -> None:
-        """Start de tradingloop voor vandaag."""
         if self.is_engine_live():
             logging.info("Trader draait al — start overgeslagen.")
             return
@@ -119,12 +121,7 @@ class Trader:
     def stop(self) -> None:
         self._running = False
         self._engine_live = False
-        self.ibkr.stop_stream()
-        # Verbinding blijft actief voor dashboard cash-polling
-
-    # ------------------------------------------------------------------
-    # Hoofdloop
-    # ------------------------------------------------------------------
+        self._bar_stream.stop_stream()
 
     def _run_loop(self) -> None:
         try:
@@ -135,7 +132,6 @@ class Trader:
         finally:
             self._running = False
             self._engine_live = False
-            # Zet active=False in state zodat dashboard/UI niet "HANDELT" toont
             with self._lock:
                 state = self._state
             if state is not None:
@@ -151,20 +147,13 @@ class Trader:
             logging.warning("Geen setups geladen — trader stopt.")
             return
 
-        # Verbinding maken met IB Gateway
-        try:
-            self.ibkr.connect()
-        except Exception as exc:
-            logging.error("IBKR verbinding mislukt: %s", exc)
-            self.notifier.send(f"IBKR verbinding mislukt: {exc}")
-            return
+        self.client.connect()
 
-        # OTC-filter: verwijder aandelen die IBKR niet toelaat (MiFID II)
-        tradable = []
-        blocked  = []
+        tradable: List[Setup] = []
+        blocked: List[str] = []
         for s in setups:
             try:
-                ok = self.ibkr.is_tradable(s.ticker)
+                ok = self.client.is_tradable(s.ticker)
             except Exception as exc:
                 logging.warning("Tradable-check mislukt voor %s: %s", s.ticker, exc)
                 ok = False
@@ -174,68 +163,48 @@ class Trader:
                 blocked.append(s.ticker)
 
         if blocked:
-            logging.warning("OTC-filter: %d tickers overgeslagen: %s", len(blocked), blocked)
-            self.notifier.send(f"OTC-filter: {', '.join(blocked)} overgeslagen (niet verhandelbaar via IBKR)")
+            logging.warning(
+                "Geen data/toegang voor %d tickers (overgeslagen): %s", len(blocked), blocked
+            )
+            self.notifier.send(f"Overgeslagen (geen data/toegang): {', '.join(blocked)}")
 
         if not tradable:
-            logging.warning(
-                "Geen verhandelbare setups na OTC-filter (%d geparsed, %d geblokkeerd: %s) — trader stopt.",
-                len(setups), len(blocked), blocked,
-            )
-            self.notifier.send(
-                f"Geen verhandelbare setups na OTC-filter. "
-                f"Geladen: {len(setups)} ({', '.join(s.ticker for s in setups)}). "
-                f"Geblokkeerd: {', '.join(blocked) or '—'}."
-            )
+            logging.warning("Geen verhandelbare setups — trader stopt.")
+            self.notifier.send("Geen verhandelbare setups na data-check.")
             return
 
-        tickers   = [s.ticker for s in tradable]
-        setup_map: Dict[str, Setup] = {s.ticker: s for s in tradable}
+        tickers = [s.ticker for s in tradable]
+        data_src = self.settings.effective_data_source()
+        broker = self.settings.effective_broker()
 
-        with self._lock:
-            state = self._state
-        if state is not None:
-            imported = self.sync_ibkr_positions(state, notify=True)
-            if imported:
-                logging.info("IBKR posities gesynchroniseerd: %s", ", ".join(imported))
+        self._bar_stream.subscribe_bars(tickers, self._on_bar)
+        self._bar_stream.start_stream()
 
-        # Abonneer op 1m bars
-        self.ibkr.subscribe_bars(tickers, self._on_bar)
-        self.ibkr.start_stream()
-
-        mode = "paper" if self.settings.paper_mode else "LIVE"
         with self._lock:
             st = self._state
         cash = self._portfolio_cash(st) if st else self.settings.paper_capital
-        cap_note = ""
-        if self.settings.tracked_capital and not self.settings.paper_mode:
-            cap_note = " (tracked uit state)"
-        elif not self.settings.paper_mode:
-            try:
-                _amt, cur = self.ibkr.get_trading_cash()
-                bals = self.ibkr.get_cash_balances()
-                if bals:
-                    cap_note = (
-                        f" | IB: {', '.join(f'{c} {bals[c]:.2f}' for c in sorted(bals))}"
-                        f" | sizing: {cur}"
-                    )
-            except Exception:
-                pass
-        msg  = (
-            f"Stocktrader gestart [{mode}] | {len(setups)} setups | "
-            f"Kapitaal sizing: {cash:.2f}{cap_note}\n"
-            + ", ".join(tickers)
+
+        t212_mode = ""
+        if broker == "t212":
+            t212_mode = " [DEMO]" if self.settings.t212_demo else " [LIVE]"
+
+        msg = (
+            f"Stocktrader gestart [{broker.upper()}{t212_mode}] | data={data_src} | "
+            f"{len(tradable)} setups | Kapitaal: ${cash:.2f}\n" + ", ".join(tickers)
         )
         logging.info(msg)
         self.notifier.send(msg)
+
         self._engine_live = True
+        self._last_bar = {}
+        self._data_blocked = set()
+        self._engine_started_at = time.monotonic()
+        self._last_bar_health_log = 0.0
+        stale_sec = self.settings.stale_bar_seconds()
+        block_sec = stale_sec * _DATA_STALE_BLOCK_FACTOR
+        _stale_warned: Set[str] = set()
+        _STALE_GRACE_SEC = max(600, stale_sec)
 
-        # Reset bar-timestamps bij (her)start
-        self._last_bar = {t: time.monotonic() for t in tickers}
-        _STALE_BAR_SEC = 300  # 5 min zonder bar → stream waarschijnlijk gestorven
-        _stale_warned: set = set()
-
-        # Wacht tot EOD exit tijd
         while self._running:
             now = datetime.now(ET)
             if now.hour > MARKET_CLOSE_H or (
@@ -244,62 +213,69 @@ class Trader:
                 self._eod_exit()
                 break
 
-            # --- IBKR-disconnect detectie + stream-reconnect ---
-            if not self.settings.paper_mode and not self.ibkr.is_connected():
-                logging.warning("IBKR disconnect gedetecteerd — wacht op reconnect...")
-                self.notifier.send("IBKR verbinding verbroken — wacht op reconnect")
-                self._engine_live = False
-                # Wacht tot achtergrond-loop opnieuw verbindt (max 120s)
-                for _ in range(24):
-                    time.sleep(5)
-                    if self.ibkr.is_connected() and self.ibkr.get_cash_balances():
-                        break
-                if self.ibkr.is_connected():
-                    logging.info("IBKR reconnect — bar-streams opnieuw subscriben")
-                    self.notifier.send("IBKR reconnect — bar-streams hervatten")
-                    try:
-                        self.ibkr.stop_stream()
-                        self.ibkr.subscribe_bars(tickers, self._on_bar)
-                        self.ibkr.start_stream()
-                        self._last_bar = {t: time.monotonic() for t in tickers}
-                        _stale_warned.clear()
-                        self._engine_live = True
-                    except Exception as exc:
-                        logging.error("Stream-reconnect mislukt: %s", exc)
-                        self.notifier.send(f"Stream-reconnect mislukt: {exc} — stoppen")
-                        break
-                else:
-                    logging.error("IBKR reconnect timeout — trader stopt")
-                    self.notifier.send("IBKR reconnect timeout — trader stopt")
-                    break
-
-            # --- Stale-bar watchdog ---
             if self._engine_live:
                 now_mono = time.monotonic()
-                for tkr, last_t in self._last_bar.items():
-                    age = now_mono - last_t
-                    if age > _STALE_BAR_SEC and tkr not in _stale_warned:
-                        logging.warning(
-                            "STALE BAR: %s — geen bar in %.0fs (stream mogelijk dood)",
-                            tkr, age,
+                uptime = now_mono - self._engine_started_at
+
+                if now_mono - self._last_bar_health_log >= 300:
+                    self._log_bar_health(tickers, stale_sec, data_src)
+                    self._last_bar_health_log = now_mono
+
+                if uptime >= _STALE_GRACE_SEC:
+                    for tkr in tickers:
+                        last_t = self._last_bar.get(tkr)
+                        if last_t is None:
+                            if tkr not in _stale_warned:
+                                logging.warning(
+                                    "STALE BAR: %s — nog geen nieuwe bar (data=%s)",
+                                    tkr, data_src,
+                                )
+                                _stale_warned.add(tkr)
+                            continue
+                        age = now_mono - last_t
+                        if age > stale_sec and tkr not in _stale_warned:
+                            logging.warning(
+                                "STALE BAR: %s — geen bar in %.0fs (limiet=%ds, data=%s)",
+                                tkr, age, stale_sec, data_src,
+                            )
+                            _stale_warned.add(tkr)
+                        elif age <= stale_sec and tkr in _stale_warned:
+                            _stale_warned.discard(tkr)
+                            if tkr in self._data_blocked:
+                                self._data_blocked.discard(tkr)
+                                logging.info("Data hersteld voor %s — blokkade opgeheven.", tkr)
+
+                        # Blokkeer handel als data te lang oud is
+                        if age > block_sec and tkr not in self._data_blocked:
+                            self._data_blocked.add(tkr)
+                            logging.warning(
+                                "DATA BLOCK: %s geblokkeerd voor handel (geen bar in %.0fs).",
+                                tkr, age,
+                            )
+
+                    received = sum(1 for t in tickers if t in self._last_bar)
+                    if received > 0 and len(_stale_warned) >= len(tickers):
+                        self.notifier.send(
+                            f"ALARM: geen nieuwe bars in >{stale_sec}s voor alle tickers "
+                            f"(data={data_src})."
                         )
-                        _stale_warned.add(tkr)
-                # Als ALLE tickers stale zijn: hard alarm
-                if _stale_warned and len(_stale_warned) >= len(tickers):
-                    logging.error("Alle bar-streams stale — Telegram alarm")
-                    self.notifier.send(
-                        f"ALARM: alle {len(tickers)} tickers geen bar in >{_STALE_BAR_SEC}s "
-                        f"— stream waarschijnlijk dood. Herstart de bot."
-                    )
-                    _stale_warned.clear()  # reset zodat alarm niet elke 15s afgaat
+                        _stale_warned.clear()
 
             time.sleep(15)
 
         self.stop()
 
-    # ------------------------------------------------------------------
-    # Bar handler (real-time 1m candles)
-    # ------------------------------------------------------------------
+    def _log_bar_health(self, tickers: List[str], stale_sec: int, data_src: str) -> None:
+        now_mono = time.monotonic()
+        parts = []
+        for tkr in tickers:
+            last_t = self._last_bar.get(tkr)
+            blocked = " [BLOCKED]" if tkr in self._data_blocked else ""
+            if last_t is None:
+                parts.append(f"{tkr}:geen{blocked}")
+            else:
+                parts.append(f"{tkr}:{now_mono - last_t:.0f}s{blocked}")
+        logging.info("Bar health (limiet=%ds, data=%s): %s", stale_sec, data_src, ", ".join(parts))
 
     def _on_bar(
         self,
@@ -311,27 +287,35 @@ class Trader:
         volume: float,
         is_new_bar: bool = True,
     ) -> None:
+        if is_new_bar:
+            self._last_bar[ticker] = time.monotonic()
+            # Hef data-blokkade op zodra er weer data binnenkomt
+            if ticker in self._data_blocked:
+                self._data_blocked.discard(ticker)
+                logging.info("Data hersteld voor %s via binnenkomende bar.", ticker)
+            # Zet prijs-cache bij op broker zodat get_latest_price up-to-date is
+            if hasattr(self.client, "update_last_price"):
+                self.client.update_last_price(ticker, close)
+
         with self._lock:
             if self._state is None:
                 return
 
-            state     = self._state
+            state = self._state
             setup_map = {s.ticker: s for s in state.get_setups()}
-            setup     = setup_map.get(ticker)
+            setup = setup_map.get(ticker)
             if setup is None:
                 return
 
             self._bar_count[ticker] += 1
             bar_num = self._bar_count[ticker]
 
-            self._last_bar[ticker] = time.monotonic()
             logging.debug(
                 "BAR #%d %s  O=%.4f H=%.4f L=%.4f C=%.4f V=%.0f%s",
                 bar_num, ticker, open_, high, low, close, volume,
                 "" if is_new_bar else " (snapshot)",
             )
 
-            # ORB window opbouwen
             orb_min = self.settings.orb_minutes
             if orb_min > 0 and bar_num <= orb_min:
                 self._orb_volumes[ticker].append(volume)
@@ -339,39 +323,32 @@ class Trader:
                     self._orb_done[ticker] = True
                     avg = orb_avg_volume(self._orb_volumes[ticker])
                     logging.info("ORB klaar voor %s (avg vol=%.0f)", ticker, avg or 0)
-                return  # geen trades tijdens ORB window
+                return
 
             orb_avg = orb_avg_volume(self._orb_volumes[ticker])
-
             positions = state.get_positions()
 
-            # Snapshot bij subscribe: geen entry/exit (voorkomt valse breakout op oude bar)
             if not is_new_bar:
                 return
 
-            if (
-                not self.settings.paper_mode
-                and ticker not in positions
-                and setup is not None
-            ):
-                self._sync_ticker_from_ibkr(state, setup)
+            # Sla trade-signalen over als data tijdelijk geblokkeerd is
+            if ticker in self._data_blocked:
+                logging.debug("BAR %s overgeslagen — data geblokkeerd.", ticker)
+                return
 
-            positions = state.get_positions()
-
-            # --- EXIT: stop of target ---
             if ticker in positions:
                 pos = positions[ticker]
                 if low <= pos.stop_price:
-                    logging.info("STOP geraakt voor %s | low=%.4f <= stop=%.4f", ticker, low, pos.stop_price)
+                    logging.info("STOP %s | low=%.4f", ticker, low)
                     self._exit(state, pos, pos.stop_price, "STOP")
                 elif high >= pos.target_price:
-                    logging.info("TARGET geraakt voor %s | high=%.4f >= t1=%.4f", ticker, high, pos.target_price)
+                    logging.info("T1 %s | high=%.4f", ticker, high)
                     self._exit(state, pos, pos.target_price, "T1")
                 return
 
-            # --- ENTRY: breakout check ---
-            if ticker in {t.ticker for t in state.get_closed_trades()}:
-                return  # al gehandeld vandaag
+            closed_today = {t.ticker for t in state.get_closed_trades()}
+            if ticker in closed_today:
+                return
 
             vol_ok = (
                 orb_avg is None
@@ -381,33 +358,19 @@ class Trader:
 
             if high >= setup.break_:
                 if vol_ok:
-                    logging.info("BREAKOUT %s | high=%.4f >= break=%.4f | vol=%.0f", ticker, high, setup.break_, volume)
+                    logging.info(
+                        "BREAKOUT %s | high=%.4f >= break=%.4f | vol=%.0f",
+                        ticker, high, setup.break_, volume,
+                    )
                     self._enter(state, setup)
                 else:
-                    logging.info("BREAKOUT %s GEBLOKKEERD (volume te laag) | vol=%.0f orb_avg=%.0f mult=%.1f",
-                        ticker, volume, orb_avg, self.settings.volume_mult)
-
-    # ------------------------------------------------------------------
-    # Kapitaal (tracked vs IBKR-saldo)
-    # ------------------------------------------------------------------
+                    logging.info(
+                        "BREAKOUT %s volume te laag | vol=%.0f need>=%.0f",
+                        ticker, volume, (self.settings.volume_mult * orb_avg) if orb_avg else 0,
+                    )
 
     def _portfolio_cash(self, state: DayState) -> float:
-        """Cash voor sizing: state bij tracked capital, anders IBKR."""
-        if self.settings.paper_mode or not self.settings.tracked_capital:
-            return self.ibkr.get_cash()
-        if state.cash <= 0:
-            self.store.update_cash(state, self.settings.paper_capital)
-        return state.cash
-
-    def _debit_cash(self, state: DayState, amount: float) -> None:
-        if not self.settings.tracked_capital or self.settings.paper_mode:
-            return
-        self.store.update_cash(state, max(0.0, state.cash - amount))
-
-    def _credit_cash(self, state: DayState, amount: float) -> None:
-        if not self.settings.tracked_capital or self.settings.paper_mode:
-            return
-        self.store.update_cash(state, state.cash + amount)
+        return self.client.get_cash()
 
     def _cap_shares(self, shares: int, size_price: float) -> int:
         s = self.settings
@@ -416,67 +379,6 @@ class Trader:
         if s.max_shares_per_order > 0:
             shares = min(shares, s.max_shares_per_order)
         return shares
-
-    # ------------------------------------------------------------------
-    # IBKR ↔ state sync (orders kunnen vullen vóór state-save bij timeout)
-    # ------------------------------------------------------------------
-
-    def sync_ibkr_positions(
-        self, state: DayState, *, notify: bool = False,
-    ) -> List[str]:
-        """Importeer open IBKR-posities die in de watchlist staan maar niet in state."""
-        if self.settings.paper_mode:
-            return []
-        try:
-            ibkr_pos = self.ibkr.get_stock_positions()
-        except Exception as exc:
-            logging.warning("IBKR posities ophalen mislukt: %s", exc)
-            return []
-
-        setup_map = {s.ticker: s for s in state.get_setups()}
-        imported: List[str] = []
-        for ticker, info in ibkr_pos.items():
-            if info.get("side") != "long":
-                logging.warning(
-                    "IBKR positie %s (%s) niet long — handmatig afhandelen.",
-                    ticker, info.get("side"),
-                )
-                continue
-            setup = setup_map.get(ticker)
-            if setup is None:
-                logging.warning(
-                    "IBKR positie %s x%d niet in watchlist — niet beheerd door bot.",
-                    ticker, info["shares"],
-                )
-                continue
-            if ticker in state.positions:
-                continue
-            self._record_position(
-                state, setup, info["shares"], info.get("avg_cost") or setup.break_,
-                order_id="ibkr-sync",
-                label="HERSTELD",
-                notify=notify,
-            )
-            imported.append(ticker)
-        return imported
-
-    def _sync_ticker_from_ibkr(self, state: DayState, setup: Setup) -> bool:
-        if self.settings.paper_mode or setup.ticker in state.positions:
-            return False
-        try:
-            ibkr_pos = self.ibkr.get_stock_positions()
-        except Exception:
-            return False
-        info = ibkr_pos.get(setup.ticker)
-        if not info or info.get("side") != "long" or info["shares"] < 1:
-            return False
-        self._record_position(
-            state, setup, info["shares"], info.get("avg_cost") or setup.break_,
-            order_id="ibkr-sync",
-            label="HERSTELD",
-            notify=True,
-        )
-        return True
 
     def _record_position(
         self,
@@ -510,209 +412,82 @@ class Trader:
         if notify:
             self.notifier.send(msg)
 
-    def _try_recover_entry(
-        self, state: DayState, setup: Setup, expected_shares: int,
-    ) -> bool:
-        """Order-timeout maar positie staat wél op IBKR → alsnog in state + Telegram."""
-        if self.settings.paper_mode:
-            return False
-        try:
-            ibkr_pos = self.ibkr.get_stock_positions()
-        except Exception as exc:
-            logging.warning("Recover check mislukt voor %s: %s", setup.ticker, exc)
-            return False
-        info = ibkr_pos.get(setup.ticker)
-        if not info or info.get("side") != "long" or info["shares"] < 1:
-            return False
-        shares = info["shares"]
-        if shares != expected_shares:
-            logging.warning(
-                "Recover %s: verwacht %d shares, IBKR heeft %d",
-                setup.ticker, expected_shares, shares,
-            )
-        self._record_position(
-            state, setup, shares, info.get("avg_cost") or setup.break_,
-            order_id="recovered",
-            label="ENTRY HERSTELD (IBKR fill, bot-timeout)",
-            notify=True,
-        )
-        return True
-
-    # ------------------------------------------------------------------
-    # Entry
-    # ------------------------------------------------------------------
-
     def _enter(self, state: DayState, setup: Setup) -> None:
         s = self.settings
 
-        if not s.paper_mode:
-            if setup.ticker in state.positions:
-                return
-            if self._sync_ticker_from_ibkr(state, setup):
-                return
-
-        # Max posities check
         if len(state.positions) >= s.max_positions:
-            logging.info("Max posities (%d) bereikt — %s overgeslagen.", s.max_positions, setup.ticker)
+            logging.info("Max posities (%d) — %s overgeslagen.", s.max_positions, setup.ticker)
             return
 
         cash = self._portfolio_cash(state)
+        actual_price = self.client.get_latest_price(setup.ticker) or setup.break_
+        size_price = max(actual_price, setup.break_)
 
-        # Gebruik actuele prijs voor sizing (niet setup.break_ — die kan lager zijn dan markt)
-        actual_price = self.ibkr.get_latest_price(setup.ticker) or setup.break_
-        size_price   = max(actual_price, setup.break_)
-
-        # Portfolio waarde = cash + marktwaarde open posities (benadering: entry * shares)
         open_value = sum(
-            p["entry_price"] * p["shares"]
-            for p in state.positions.values()
+            p["entry_price"] * p["shares"] for p in state.positions.values()
         )
         portfolio = cash + open_value
 
-        above_threshold = portfolio >= s.risk_threshold_usd
-        max_pos_pct = s.max_position_pct_large if portfolio >= s.large_cap_threshold else s.max_position_pct
+        max_pos_pct = (
+            s.max_position_pct_large
+            if portfolio >= s.large_cap_threshold
+            else s.max_position_pct
+        )
 
-        if above_threshold:
-            # Risico-based sizing
+        if portfolio >= s.risk_threshold_usd:
             stop_distance = setup.break_ - setup.hold
             if stop_distance <= 0:
                 return
-            risk_amount   = portfolio * s.risk_per_trade_pct
+            risk_amount = portfolio * s.risk_per_trade_pct
             shares_by_risk = int(risk_amount / stop_distance)
-
-            # Cap op max_position_pct van portfolio
-            max_spend     = portfolio * max_pos_pct
+            max_spend = portfolio * max_pos_pct
             shares_by_cap = int(max_spend / size_price)
-
             shares = min(shares_by_risk, shares_by_cap)
-            mode   = "RISK-BASED"
+            mode = "RISK-BASED"
         else:
-            # All-in onder drempel
             available = cash * (1 - s.cash_reserve_pct)
-            shares    = int(available // size_price)
-            mode      = "ALL-IN"
+            shares = int(available // size_price)
+            mode = "ALL-IN"
 
         if shares < 1:
-            logging.warning(
-                "Onvoldoende cash voor %s | portfolio=%.2f cash=%.2f prijs=%.2f [%s]",
-                setup.ticker, portfolio, cash, size_price, mode,
-            )
+            logging.warning("Onvoldoende cash voor %s.", setup.ticker)
             return
 
-        spend = shares * size_price
-        if spend > cash * (1 - s.cash_reserve_pct):
+        if shares * size_price > cash * (1 - s.cash_reserve_pct):
             shares = int(cash * (1 - s.cash_reserve_pct) // size_price)
             if shares < 1:
-                logging.warning("Na herberekening onvoldoende cash voor %s.", setup.ticker)
                 return
 
-        capped = self._cap_shares(shares, size_price)
-        if capped < shares:
-            logging.info(
-                "Orderlimiet %s: %d → %d shares (max_order=$%.0f)",
-                setup.ticker, shares, capped, s.max_order_usd,
-            )
-            shares = capped
+        shares = self._cap_shares(shares, size_price)
         if shares < 1:
-            logging.warning("Order te klein na limiet voor %s.", setup.ticker)
             return
 
-        logging.info(
-            "ENTRY order %s x%d @~%.4f [%s] portfolio=%.0f cash=%.0f spend≈$%.0f",
-            setup.ticker, shares, size_price, mode, portfolio, cash, shares * size_price,
-        )
+        logging.info("ENTRY %s x%d @~%.4f [%s]", setup.ticker, shares, size_price, mode)
         try:
-            order_id = self.ibkr.buy_market(setup.ticker, shares)
+            order_id = self.client.buy_market(setup.ticker, shares)
         except Exception as exc:
-            if self._try_recover_entry(state, setup, shares):
-                return
             detail = str(exc).strip() or repr(exc)
-            logging.error(
-                "Order mislukt voor %s x%d: %s", setup.ticker, shares, detail,
-            )
-            self.notifier.send(
-                f"ORDER MISLUKT {setup.ticker} x{shares}: {detail}"
-            )
+            logging.error("Order mislukt %s: %s", setup.ticker, detail)
+            self.notifier.send(f"ORDER MISLUKT {setup.ticker} x{shares}: {detail}")
             return
 
-        # Gebruik werkelijke fill-prijs als beschikbaar; val terug op size_price
-        fill_price = size_price
-        if not self.settings.paper_mode:
-            try:
-                actual = self.ibkr.get_latest_price(setup.ticker)
-                if actual and actual > 0:
-                    fill_price = actual
-            except Exception:
-                pass
-
-        spend = shares * fill_price
-        self._debit_cash(state, spend)
+        fill_price = self.client.get_latest_price(setup.ticker) or size_price
         self._record_position(
             state, setup, shares, fill_price,
             order_id=order_id,
             label=f"ENTRY [{mode}]",
             notify=True,
         )
-        max_loss = (setup.break_ - setup.hold) * shares
-        logging.info(
-            "ENTRY %s R:R %.1fx portfolio=$%.2f max_loss=$%.2f fill=%.4f (size_ref=%.4f)",
-            setup.ticker, setup.rr_t1(), portfolio, max_loss, fill_price, size_price,
-        )
-
-    # ------------------------------------------------------------------
-    # Exit
-    # ------------------------------------------------------------------
 
     def _exit(self, state: DayState, pos: Position, exit_price: float, reason: str) -> None:
         try:
-            self.ibkr.sell_market(pos.ticker, pos.shares)
+            self.client.sell_market(pos.ticker, pos.shares)
         except Exception as exc:
-            if self._try_recover_exit(state, pos, exit_price, reason):
-                return
             detail = str(exc).strip() or repr(exc)
-            logging.error("Sell mislukt voor %s: %s", pos.ticker, detail)
+            logging.error("Sell mislukt %s: %s", pos.ticker, detail)
             self.notifier.send(f"SELL MISLUKT {pos.ticker}: {detail}")
             return
 
-        pnl   = (exit_price - pos.entry_price) * pos.shares
-        trade = ClosedTrade(
-            ticker=pos.ticker,
-            shares=pos.shares,
-            entry_price=pos.entry_price,
-            exit_price=exit_price,
-            entry_time=pos.entry_time,
-            exit_time=datetime.now(ET).strftime("%H:%M"),
-            reason=reason,
-            pnl=round(pnl, 2),
-        )
-        self.store.close_position(state, trade)
-        self._credit_cash(state, exit_price * pos.shares)
-
-        emoji = "WIN" if pnl >= 0 else "STOP"
-        msg   = (
-            f"{emoji} {pos.ticker} | {pos.shares}x @ ${exit_price:.2f} | "
-            f"PnL: ${pnl:+.2f} | Reden: {reason}"
-        )
-        logging.info(msg)
-        self.notifier.send(msg)
-
-    def _try_recover_exit(
-        self,
-        state: DayState,
-        pos: Position,
-        exit_price: float,
-        reason: str,
-    ) -> bool:
-        """Sell-timeout maar positie weg bij IBKR → trade alsnog sluiten in state."""
-        if self.settings.paper_mode:
-            return False
-        try:
-            ibkr_pos = self.ibkr.get_stock_positions()
-        except Exception:
-            return False
-        info = ibkr_pos.get(pos.ticker)
-        if info and info.get("shares", 0) > 0:
-            return False
         pnl = (exit_price - pos.entry_price) * pos.shares
         trade = ClosedTrade(
             ticker=pos.ticker,
@@ -725,25 +500,20 @@ class Trader:
             pnl=round(pnl, 2),
         )
         self.store.close_position(state, trade)
-        self._credit_cash(state, exit_price * pos.shares)
+
         emoji = "WIN" if pnl >= 0 else "STOP"
         msg = (
-            f"{emoji} {pos.ticker} (HERSTELD) | {pos.shares}x @ ${exit_price:.2f} | "
-            f"PnL: ${pnl:+.2f} | Reden: {reason}"
+            f"{emoji} {pos.ticker} | {pos.shares}x @ ${exit_price:.2f} | "
+            f"PnL: ${pnl:+.2f} | {reason}"
         )
         logging.info(msg)
         self.notifier.send(msg)
-        return True
-
-    # ------------------------------------------------------------------
-    # EOD
-    # ------------------------------------------------------------------
 
     def _eod_exit(self) -> None:
         with self._lock:
             if self._state is None:
                 return
-            state     = self._state
+            state = self._state
             positions = state.get_positions()
 
         if not positions:
@@ -753,26 +523,15 @@ class Trader:
         logging.info("EOD: %d posities sluiten...", len(positions))
         self.notifier.send(f"EOD: {len(positions)} posities sluiten...")
 
-        _MAX_EOD_TRIES = 3
-        for ticker, pos in positions.items():
-            price = self.ibkr.get_latest_price(ticker) or pos.entry_price
-            for attempt in range(1, _MAX_EOD_TRIES + 1):
+        for ticker, pos in list(positions.items()):
+            price = self.client.get_latest_price(ticker) or pos.entry_price
+            for attempt in range(1, 4):
                 try:
                     with self._lock:
                         self._exit(state, pos, price, "EOD")
                     break
                 except Exception as exc:
-                    if attempt < _MAX_EOD_TRIES:
-                        logging.warning(
-                            "EOD exit %s poging %d mislukt (%s) — opnieuw...",
-                            ticker, attempt, exc,
-                        )
+                    if attempt < 3:
                         time.sleep(2)
                     else:
-                        logging.error(
-                            "EOD exit %s definitief mislukt na %d pogingen: %s",
-                            ticker, _MAX_EOD_TRIES, exc,
-                        )
-                        self.notifier.send(
-                            f"EOD EXIT MISLUKT {ticker} na {_MAX_EOD_TRIES} pogingen: {exc}"
-                        )
+                        self.notifier.send(f"EOD EXIT MISLUKT {ticker}: {exc}")
