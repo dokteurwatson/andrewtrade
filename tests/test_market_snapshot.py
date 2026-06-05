@@ -138,7 +138,7 @@ def test_enrich_quotes_with_reference():
         "stocktrader.market_snapshot.reference_price",
         return_value=(12.34, "vorige slot"),
     ):
-        out = enrich_quotes_with_reference(rows)
+        out = enrich_quotes_with_reference(rows, fetch_missing=True)
     assert out[0]["last"] == 12.34
     assert out[0]["last_label"] == "vorige slot"
     assert out[0]["last_source"] == "ref"

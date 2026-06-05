@@ -19,6 +19,7 @@ from .market_snapshot import (
     apply_follow_status,
     enrich_quotes_with_reference,
     placeholder_snapshots,
+    prefetch_reference_prices,
     quote_source_hint,
     yfinance_snapshots,
 )
@@ -43,47 +44,30 @@ trader = Trader(settings)
 _AUTO_RESUME = os.getenv("AUTO_RESUME_TRADING", "true").lower() == "true"
 _resume_lock = threading.Lock()
 _resume_done = False
-_tradable_cache: dict[str, tuple[bool, float]] = {}
-_TRADABLE_CACHE_TTL = 60.0
+_prefetch_lock = threading.Lock()
+_prefetch_running = False
 
 
-def _broker_blocked_preview(setups) -> dict[str, dict]:
-    """T212 tradable-check vóór bot-start (gecachet, voor dashboard-labels)."""
-    if settings.effective_broker() != "t212" or not setups:
-        return {}
-    now = time.monotonic()
-    out: dict[str, dict] = {}
-    for s in setups:
-        t = s.ticker
-        cached = _tradable_cache.get(t)
-        if cached and now - cached[1] < _TRADABLE_CACHE_TTL:
-            if not cached[0]:
-                out[t] = {
-                    "followed": False,
-                    "exclude_reason": "Niet verhandelbaar op T212",
-                }
-            continue
+def _schedule_reference_prefetch(setups) -> None:
+    """Yahoo ref-prijzen op achtergrond — nooit synchroon op page load."""
+    global _prefetch_running
+    if not setups:
+        return
+    tickers = [s.ticker for s in setups]
+    with _prefetch_lock:
+        if _prefetch_running:
+            return
+        _prefetch_running = True
+
+    def _run() -> None:
+        global _prefetch_running
         try:
-            ok = trader.client.is_tradable(t)
-        except Exception:
-            ok = False
-        _tradable_cache[t] = (ok, now)
-        if not ok:
-            out[t] = {
-                "followed": False,
-                "exclude_reason": "Niet verhandelbaar op T212",
-            }
-    return out
+            prefetch_reference_prices(tickers)
+        finally:
+            with _prefetch_lock:
+                _prefetch_running = False
 
-
-def _follow_map(setups, *, engine_live: bool) -> dict[str, dict]:
-    if engine_live:
-        return trader.get_follow_status(setups)
-    follow = _broker_blocked_preview(setups)
-    for t, meta in trader.get_follow_status(setups).items():
-        if not meta.get("followed", True):
-            follow[t] = meta
-    return follow
+    threading.Thread(target=_run, daemon=True, name="ref-prefetch").start()
 
 
 def _build_live_quotes(setups, *, engine_live: bool) -> list:
@@ -103,9 +87,10 @@ def _build_live_quotes(setups, *, engine_live: bool) -> list:
         else:
             rows = apply_follow_status(
                 placeholder_snapshots(setups),
-                _follow_map(setups, engine_live=False),
+                trader.get_follow_status(setups),
             )
-        return enrich_quotes_with_reference(rows)
+        _schedule_reference_prefetch(setups)
+        return enrich_quotes_with_reference(rows, fetch_missing=False)
     except Exception as exc:
         logging.warning("Live quotes mislukt: %s", exc)
         return []
@@ -153,7 +138,8 @@ def today() -> date:
 
 def load_state(*, refresh_cash: bool = True) -> DayState:
     state = store.load(today(), settings.paper_capital)
-    if refresh_cash and settings.effective_broker() == "t212":
+    # Geen T212 API op page load — voorkomt blokkeren van single-thread Flask.
+    if refresh_cash and settings.effective_broker() == "t212" and trader.is_engine_live():
         try:
             actual_cash = trader.client.get_cash()
             if actual_cash >= 0:
@@ -196,15 +182,27 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
     data_source = settings.effective_data_source()
     live_quotes = _build_live_quotes(setups, engine_live=engine_live)
     quote_by_ticker = {q["ticker"]: q for q in live_quotes}
-    excluded_tickers = [
+    for t in warn_blocked or []:
+        quote_by_ticker.setdefault(t, {
+            "ticker": t,
+            "followed": False,
+            "exclude_reason": "Niet verhandelbaar op T212",
+            "status": "Niet verhandelbaar op T212",
+            "last": None,
+        })
+    excluded_tickers = sorted({
         q["ticker"]
-        for q in live_quotes
+        for q in quote_by_ticker.values()
         if not q.get("followed", True)
-    ]
+    })
 
     is_paper_broker = settings.effective_broker() == "paper"
     account_currency = "USD"
-    if settings.effective_broker() == "t212" and isinstance(trader.client, T212Client):
+    if (
+        engine_live
+        and settings.effective_broker() == "t212"
+        and isinstance(trader.client, T212Client)
+    ):
         try:
             account_currency = trader.client.get_account_currency()
         except Exception:
@@ -416,5 +414,23 @@ def health():
     })
 
 
+def _prefetch_on_boot() -> None:
+    try:
+        state = store.load(trading_date(), settings.paper_capital)
+        setups = state.get_setups()
+        if setups:
+            _schedule_reference_prefetch(setups)
+    except Exception as exc:
+        logging.debug("Ref-prefetch bij boot overgeslagen: %s", exc)
+
+
+_prefetch_on_boot()
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=settings.dashboard_port, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=settings.dashboard_port,
+        debug=False,
+        threaded=True,
+    )

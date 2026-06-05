@@ -60,6 +60,8 @@ class FinazonBarStream:
         self._callbacks_lock = threading.Lock()
         self._skipped: Set[str] = set()
         self._exclusion_handler: Optional[Callable[[str], None]] = None
+        self._first_bar_logged: Set[str] = set()
+        self._heartbeat_logged = False
         self._running = False
         self._ws = None
         self._ws_thread: Optional[threading.Thread] = None
@@ -83,6 +85,8 @@ class FinazonBarStream:
             n = len(self._callbacks)
         if n == 0:
             logging.warning("FinazonBarStream: geen tickers geregistreerd vóór start.")
+        self._first_bar_logged.clear()
+        self._heartbeat_logged = False
         self._running = True
         self._ws_thread = threading.Thread(
             target=self._run_ws, daemon=True, name="finazon-ws"
@@ -232,6 +236,9 @@ class FinazonBarStream:
             return
 
         if event == "heartbeat":
+            if not self._heartbeat_logged:
+                self._heartbeat_logged = True
+                logging.info("Finazon WS heartbeat ontvangen — verbinding actief.")
             return
 
         # Bar-bericht: heeft "s" (symbool) en OHLCV velden
@@ -252,6 +259,12 @@ class FinazonBarStream:
             handler = self._callbacks.get(ticker)
         if handler is None:
             return
+        if ticker and ticker not in self._first_bar_logged:
+            self._first_bar_logged.add(ticker)
+            logging.info(
+                "Finazon eerste bar: %s C=%.4f V=%.0f",
+                ticker, float(msg.get("c", 0)), float(msg.get("v", 0)),
+            )
         try:
             handler(
                 ticker,

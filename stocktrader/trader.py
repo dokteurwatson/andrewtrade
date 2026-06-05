@@ -115,6 +115,9 @@ class Trader:
         self._stream_excluded: Set[str] = set()
         self._engine_started_at: float = 0.0
         self._last_bar_health_log: float = 0.0
+        self._last_heartbeat_log: float = 0.0
+        self._bars_received: int = 0
+        self._no_bars_market_warned: bool = False
 
     def load_day(self, state: DayState) -> None:
         with self._lock:
@@ -353,18 +356,27 @@ class Trader:
             self._quote_snapshots = {}
             self._data_blocked = set()
         self._engine_started_at = time.monotonic()
-        self._last_bar_health_log = 0.0
+        self._last_bar_health_log = self._engine_started_at
+        self._last_heartbeat_log = self._engine_started_at
+        self._bars_received = 0
+        self._no_bars_market_warned = False
+
+        stale_sec = self.settings.stale_bar_seconds()
+        block_sec = stale_sec * _DATA_STALE_BLOCK_FACTOR
+        _stale_warned: Set[str] = set()
+        _STALE_GRACE_SEC = max(600, stale_sec)
+
+        logging.info(
+            "Trader monitor-loop actief | %d tickers | stale-waarschuwing na %ds | "
+            "bar-health elke 5m",
+            len(tickers), _STALE_GRACE_SEC,
+        )
 
         # Start order worker thread
         self._order_worker_thread = threading.Thread(
             target=self._order_worker, daemon=True, name="order-worker"
         )
         self._order_worker_thread.start()
-
-        stale_sec = self.settings.stale_bar_seconds()
-        block_sec = stale_sec * _DATA_STALE_BLOCK_FACTOR
-        _stale_warned: Set[str] = set()
-        _STALE_GRACE_SEC = max(600, stale_sec)
 
         while self._running:
             now = datetime.now(ET)
@@ -381,6 +393,36 @@ class Trader:
                 if now_mono - self._last_bar_health_log >= 300:
                     self._log_bar_health(tickers, stale_sec, data_src)
                     self._last_bar_health_log = now_mono
+
+                if now_mono - self._last_heartbeat_log >= 300:
+                    with self._lock:
+                        n_bars = self._bars_received
+                        n_last = len(self._last_bar)
+                    logging.info(
+                        "Trader heartbeat | uptime=%.0fm | bars=%d | tickers_met_bar=%d/%d",
+                        uptime / 60, n_bars, n_last, len(tickers),
+                    )
+                    self._last_heartbeat_log = now_mono
+
+                in_regular_session = (
+                    (now.hour > MARKET_OPEN_H or (now.hour == MARKET_OPEN_H and now.minute >= MARKET_OPEN_M))
+                    and (now.hour < MARKET_CLOSE_H or (now.hour == MARKET_CLOSE_H and now.minute < MARKET_CLOSE_M))
+                )
+                if (
+                    in_regular_session
+                    and uptime >= _STALE_GRACE_SEC
+                    and not self._no_bars_market_warned
+                ):
+                    with self._lock:
+                        n_last = len(self._last_bar)
+                    if n_last == 0:
+                        self._no_bars_market_warned = True
+                        msg = (
+                            f"GEEN BARS tijdens markturen ({data_src}) — geen trades mogelijk. "
+                            f"Controleer Finazon-dekking voor microcaps of schakel data-bron om."
+                        )
+                        logging.warning(msg)
+                        self.notifier.send(msg)
 
                 if uptime >= _STALE_GRACE_SEC:
                     with self._lock:
@@ -436,8 +478,15 @@ class Trader:
         with self._lock:
             last_bar_snapshot = dict(self._last_bar)
             data_blocked_snapshot = set(self._data_blocked)
+            stream_excluded = set(self._stream_excluded)
+        stream_skipped = getattr(self._bar_stream, "get_skipped_tickers", None)
+        if stream_skipped is not None:
+            stream_excluded |= stream_skipped()
         parts = []
         for tkr in tickers:
+            if tkr in stream_excluded:
+                parts.append(f"{tkr}:uitgesloten")
+                continue
             last_t = last_bar_snapshot.get(tkr)
             blocked = " [BLOCKED]" if tkr in data_blocked_snapshot else ""
             if last_t is None:
@@ -461,6 +510,7 @@ class Trader:
 
         if is_new_bar:
             with self._lock:
+                self._bars_received += 1
                 self._last_bar[ticker] = time.monotonic()
                 if ticker in self._data_blocked:
                     self._data_blocked.discard(ticker)

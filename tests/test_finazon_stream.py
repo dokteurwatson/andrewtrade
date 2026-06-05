@@ -154,6 +154,27 @@ def test_on_message_heartbeat_ignored():
     s._on_message(ws, raw)  # mag niet crashen
 
 
+def test_on_message_heartbeat_logs_once(caplog):
+    import logging
+    s = _make_stream()
+    ws = MagicMock()
+    raw = json.dumps({"event": "heartbeat", "status": "success"})
+    with caplog.at_level(logging.INFO):
+        s._on_message(ws, raw)
+        s._on_message(ws, raw)
+    assert sum(1 for r in caplog.records if "heartbeat ontvangen" in r.message) == 1
+
+
+def test_emit_bar_logs_first_bar(caplog):
+    import logging
+    s = _make_stream()
+    s._callbacks["AAPL"] = MagicMock()
+    with caplog.at_level(logging.INFO):
+        s._emit_bar({"s": "AAPL", "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "v": 999})
+        s._emit_bar({"s": "AAPL", "o": 2.0, "h": 2.5, "l": 1.5, "c": 2.0, "v": 500})
+    assert sum(1 for r in caplog.records if "eerste bar" in r.message) == 1
+
+
 def test_on_message_invalid_json_ignored():
     s = _make_stream()
     ws = MagicMock()

@@ -37,7 +37,7 @@ def _fetch_reference_price_yahoo(ticker: str) -> Tuple[Optional[float], str]:
             url,
             headers={"User-Agent": "stocktrader-ref/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=4) as resp:
             payload = json.loads(resp.read().decode())
         result = (payload.get("chart") or {}).get("result") or []
         if not result:
@@ -60,6 +60,15 @@ def _fetch_reference_price_yahoo(ticker: str) -> Tuple[Optional[float], str]:
     return None, ""
 
 
+def reference_price_cached(ticker: str) -> Tuple[Optional[float], str]:
+    """Alleen cache — geen netwerk (veilig voor request-path)."""
+    now = time.monotonic()
+    cached = _ref_price_cache.get(ticker.upper())
+    if cached and now - cached[2] < _REF_CACHE_TTL_SEC:
+        return cached[0], cached[1]
+    return None, ""
+
+
 def reference_price(ticker: str) -> Tuple[Optional[float], str]:
     now = time.monotonic()
     cached = _ref_price_cache.get(ticker.upper())
@@ -71,13 +80,29 @@ def reference_price(ticker: str) -> Tuple[Optional[float], str]:
     return price, label
 
 
-def enrich_quotes_with_reference(rows: List[dict]) -> List[dict]:
+def prefetch_reference_prices(tickers: List[str]) -> None:
+    """Achtergrond: vul referentieprijs-cache (niet op request-path)."""
+    for ticker in tickers:
+        try:
+            reference_price(ticker)
+        except Exception as exc:
+            logging.debug("Prefetch ref %s: %s", ticker, exc)
+
+
+def enrich_quotes_with_reference(
+    rows: List[dict],
+    *,
+    fetch_missing: bool = False,
+) -> List[dict]:
     """Vul Last aan met slot/pre-market als er nog geen live bar is."""
     out: List[dict] = []
     for row in rows:
         r = dict(row)
         if r.get("last") is None:
-            price, label = reference_price(r["ticker"])
+            if fetch_missing:
+                price, label = reference_price(r["ticker"])
+            else:
+                price, label = reference_price_cached(r["ticker"])
             if price is not None:
                 r["last"] = price
                 r["last_label"] = label
