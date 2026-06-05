@@ -80,6 +80,10 @@ class T212PositionNotFoundError(T212Error):
     """Positie niet gevonden bij broker — lokale state desync."""
 
 
+class T212CloseOnlyError(T212Error):
+    """Instrument staat in close-only mode — geen nieuwe buys."""
+
+
 def _is_position_gone_message(msg: str) -> bool:
     lower = msg.lower()
     return any(
@@ -219,6 +223,11 @@ class T212Client:
     def get_cash(self, *, force: bool = False) -> float:
         return self.get_account_info(force=force).cash
 
+    def invalidate_account_cache(self) -> None:
+        """Na orders: cache legen zodat volgende get_cash() vers is."""
+        self._account_cache = None
+        self._cash_cache_ts = 0.0
+
     def get_account_currency(self) -> str:
         if self._account_cache is not None:
             return self._account_cache.currency
@@ -294,6 +303,7 @@ class T212Client:
         payload = self._market_payload(t212, abs(shares))
         response = self._post("/equity/orders/market", payload)
         order_id = str(response.get("id", f"t212-buy-{ticker}-{int(time.time())}"))
+        self.invalidate_account_cache()
         logging.info(
             "T212 BUY %s x%d [%s] → order_id=%s",
             ticker, shares, self._mode, order_id,
@@ -311,6 +321,7 @@ class T212Client:
                 raise T212PositionNotFoundError(str(exc)) from exc
             raise
         order_id = str(response.get("id", f"t212-sell-{ticker}-{int(time.time())}"))
+        self.invalidate_account_cache()
         logging.info(
             "T212 SELL %s x%d [%s] → order_id=%s",
             ticker, shares, self._mode, order_id,
@@ -401,6 +412,9 @@ class T212Client:
             return T212RateLimitError(msg, retry_after=retry_after)
         if _is_position_gone_message(body):
             return T212PositionNotFoundError(msg)
+        lower = body.lower()
+        if "close-only-mode" in lower or "close only mode" in lower:
+            return T212CloseOnlyError(msg)
         return T212Error(msg)
 
     def _request_with_retry(self, method: str, path: str, payload: Optional[dict] = None) -> any:

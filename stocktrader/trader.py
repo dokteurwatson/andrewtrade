@@ -79,6 +79,13 @@ def _is_position_gone_error(exc: Exception) -> bool:
     )
 
 
+def profit_target_for_entry(setup: Setup, entry_price: float) -> Optional[float]:
+    """T1 als target; geen entry als prijs al >= T1."""
+    if entry_price >= setup.t1:
+        return None
+    return setup.t1
+
+
 class Trader:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -115,6 +122,7 @@ class Trader:
         self._quote_snapshots: Dict[str, dict] = {}
         self._data_blocked: Set[str] = set()
         self._broker_blocked: Set[str] = set()
+        self._broker_block_reason: Dict[str, str] = {}
         self._stream_excluded: Set[str] = set()
         self._engine_started_at: float = 0.0
         self._last_bar_health_log: float = 0.0
@@ -136,10 +144,20 @@ class Trader:
         with self._lock:
             self._stream_excluded.add(ticker.upper())
 
+    def _block_broker_ticker(self, ticker: str, reason: str) -> None:
+        key = ticker.upper()
+        with self._lock:
+            if key in self._broker_blocked:
+                return
+            self._broker_blocked.add(key)
+            self._broker_block_reason[key] = reason
+        logging.warning("%s geblokkeerd voor vandaag — %s", key, reason)
+
     def get_follow_status(self, setups: List[Setup]) -> Dict[str, dict]:
         """Per ticker: gevolgd door bot of uitgesloten (T212 / Finazon)."""
         with self._lock:
             broker = set(self._broker_blocked)
+            block_reason = dict(self._broker_block_reason)
             stream = set(self._stream_excluded)
             data_blk = set(self._data_blocked)
         stream_bar = getattr(self._bar_stream, "get_skipped_tickers", None)
@@ -151,7 +169,9 @@ class Trader:
             if t in broker:
                 out[t] = {
                     "followed": False,
-                    "exclude_reason": "Niet verhandelbaar op T212",
+                    "exclude_reason": block_reason.get(
+                        t, "Niet verhandelbaar op T212"
+                    ),
                 }
             elif t in stream:
                 out[t] = {
@@ -300,6 +320,9 @@ class Trader:
                 blocked.append(s.ticker)
 
         self._broker_blocked = set(blocked)
+        self._broker_block_reason = {
+            t: "Niet verhandelbaar op T212" for t in blocked
+        }
         self._stream_excluded = set()
 
         if blocked:
@@ -598,12 +621,18 @@ class Trader:
                 logging.info("BAR %s overgeslagen — data geblokkeerd.", ticker)
                 return
 
+            if ticker in self._broker_blocked:
+                return
+
             if ticker in positions:
                 pos = positions[ticker]
                 if low <= pos.stop_price:
                     logging.info("STOP %s | low=%.4f", ticker, low)
                     self._order_queue.put(("EXIT", pos, pos.stop_price, "STOP"))
-                elif high >= pos.target_price:
+                elif (
+                    pos.target_price > pos.entry_price
+                    and high >= pos.target_price
+                ):
                     logging.info("T1 %s | high=%.4f", ticker, high)
                     self._order_queue.put(("EXIT", pos, pos.target_price, "T1"))
                 return
@@ -620,7 +649,12 @@ class Trader:
             above_orb_high = orb_high is None or high >= orb_high
 
             if high >= setup.break_ and above_orb_high:
-                if vol_ok:
+                if high >= setup.t1:
+                    logging.info(
+                        "BREAKOUT %s overgeslagen — high=%.4f al >= T1=%.4f",
+                        ticker, high, setup.t1,
+                    )
+                elif vol_ok:
                     orb_info = f" | orb_high={orb_high:.4f}" if orb_high else ""
                     logging.info(
                         "BREAKOUT %s | high=%.4f >= break=%.4f | vol=%.0f%s",
@@ -638,9 +672,12 @@ class Trader:
                     ticker, high, orb_high,
                 )
 
-    def _portfolio_cash(self, state: DayState) -> float:
+    def _portfolio_cash(self, state: DayState, *, force: bool = False) -> float:
         """Cash in accountvaluta (EUR op T212 EU, USD op paper)."""
         try:
+            from .t212_client import T212Client
+            if isinstance(self.client, T212Client):
+                return self.client.get_cash(force=force)
             return self.client.get_cash()
         except Exception as exc:
             from .t212_client import T212RateLimitError, T212NetworkError
@@ -651,6 +688,23 @@ class Trader:
                 )
                 return state.cash
             raise
+
+    def _sync_cash_from_broker(self, state: DayState, label: str = "") -> None:
+        """Haal actueel saldo op bij broker en persist in dagstate."""
+        from .t212_client import T212Client, T212RateLimitError, T212NetworkError
+
+        if not isinstance(self.client, T212Client):
+            return
+        try:
+            cash = self.client.get_cash(force=True)
+            if cash >= 0:
+                self.store.update_cash(state, cash)
+                suffix = f" ({label})" if label else ""
+                ccy = self.client.get_account_currency_cached()
+                logging.info("Cash bijgewerkt%s: %.2f %s", suffix, cash, ccy)
+        except (T212RateLimitError, T212NetworkError) as exc:
+            suffix = f" ({label})" if label else ""
+            logging.warning("Cash sync mislukt%s: %s", suffix, exc)
 
     def _cash_for_usd_sizing(self, cash: float) -> float:
         """Account-cash omgerekend naar USD voor vergelijking met US-aandeelprijzen."""
@@ -679,12 +733,19 @@ class Trader:
         notify: bool,
     ) -> None:
         entry_price = entry_price if entry_price > 0 else setup.break_
+        target_price = profit_target_for_entry(setup, entry_price)
+        if target_price is None or target_price <= entry_price:
+            logging.warning(
+                "Positie %s niet opgeslagen — entry %.4f al >= T1 %.4f",
+                setup.ticker, entry_price, setup.t1,
+            )
+            return
         pos = Position(
             ticker=setup.ticker,
             shares=shares,
             entry_price=entry_price,
             stop_price=setup.hold,
-            target_price=setup.t1,
+            target_price=target_price,
             entry_time=datetime.now(ET).strftime("%H:%M"),
             order_id=order_id,
         )
@@ -692,7 +753,7 @@ class Trader:
         max_loss = (entry_price - setup.hold) * shares
         msg = (
             f"{label} {setup.ticker} | {shares}x @ ${entry_price:.2f} | "
-            f"Stop: ${setup.hold:.2f} | T1: ${setup.t1:.2f} | "
+            f"Stop: ${setup.hold:.2f} | T1: ${target_price:.2f} | "
             f"Max verlies: ${max_loss:.2f}"
         )
         logging.info(msg)
@@ -706,10 +767,17 @@ class Trader:
             logging.info("Max posities (%d) — %s overgeslagen.", s.max_positions, setup.ticker)
             return
 
-        cash = self._portfolio_cash(state)
+        cash = self._portfolio_cash(state, force=True)
         cash_usd = self._cash_for_usd_sizing(cash)
         actual_price = self.client.get_latest_price(setup.ticker) or setup.break_
         size_price = max(actual_price, setup.break_)
+
+        if profit_target_for_entry(setup, size_price) is None:
+            logging.info(
+                "Entry overgeslagen %s: prijs %.4f >= T1 %.4f",
+                setup.ticker, size_price, setup.t1,
+            )
+            return
 
         open_value = sum(
             p["entry_price"] * p["shares"] for p in state.positions.values()
@@ -761,18 +829,47 @@ class Trader:
         try:
             order_id = self.client.buy_market(setup.ticker, shares)
         except Exception as exc:
+            from .t212_client import T212CloseOnlyError
+
+            if isinstance(exc, T212CloseOnlyError):
+                self._block_broker_ticker(
+                    setup.ticker, "Close-only op T212 (rest van de dag)"
+                )
+                self.notifier.send(
+                    f"{setup.ticker}: close-only op T212 — geen nieuwe buys vandaag"
+                )
+                return
             detail = str(exc).strip() or repr(exc)
             logging.error("Order mislukt %s: %s", setup.ticker, detail)
             self.notifier.send(f"ORDER MISLUKT {setup.ticker} x{shares}: {detail}")
             return
 
         fill_price = self.client.get_latest_price(setup.ticker) or size_price
+        fill_target = profit_target_for_entry(setup, fill_price)
+        if fill_target is None or fill_target <= fill_price:
+            logging.error(
+                "ENTRY %s fill %.4f >= T1 %.4f — direct sluiten",
+                setup.ticker, fill_price, setup.t1,
+            )
+            try:
+                self.client.sell_market(setup.ticker, shares)
+                self._sync_cash_from_broker(state, "abort-sell")
+                self.notifier.send(
+                    f"ABORT {setup.ticker}: fill ${fill_price:.2f} >= T1 ${setup.t1:.2f} — direct gesloten"
+                )
+            except Exception as exc:
+                detail = str(exc).strip() or repr(exc)
+                logging.error("Abort-sell mislukt %s: %s", setup.ticker, detail)
+                self.notifier.send(f"ABORT SELL MISLUKT {setup.ticker}: {detail}")
+            return
+
         self._record_position(
             state, setup, shares, fill_price,
             order_id=order_id,
             label=f"ENTRY [{mode}]",
             notify=True,
         )
+        self._sync_cash_from_broker(state, "buy")
 
     def _do_sell(self, pos: Position) -> None:
         """Voer sell-order uit. Gooit exception bij fout."""
@@ -812,6 +909,7 @@ class Trader:
                     pos.ticker,
                 )
                 self._record_close(state, pos, exit_price, reason)
+                self._sync_cash_from_broker(state, "sell-sync")
                 self.notifier.send(
                     f"SYNC {pos.ticker}: positie al gesloten bij broker, state bijgewerkt."
                 )
@@ -822,6 +920,7 @@ class Trader:
             raise
 
         self._record_close(state, pos, exit_price, reason)
+        self._sync_cash_from_broker(state, "sell")
 
     def _eod_exit(self) -> None:
         with self._lock:

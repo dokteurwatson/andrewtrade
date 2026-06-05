@@ -11,6 +11,7 @@ import pytest
 from stocktrader.t212_client import (
     T212AuthError,
     T212Client,
+    T212CloseOnlyError,
     T212NetworkError,
     T212PositionNotFoundError,
     T212RateLimitError,
@@ -345,3 +346,17 @@ def test_classify_http_error_401():
     )
     err = c._classify_http_error(exc, "/test", "unauthorized")
     assert isinstance(err, T212AuthError)
+
+
+def test_classify_http_error_close_only():
+    import urllib.error
+    c = _make_client()
+    exc = urllib.error.HTTPError(
+        url="http://test", code=400, msg="Bad Request", hdrs={}, fp=None
+    )
+    body = (
+        '{"type":"/api-errors/instrument-close-only-mode",'
+        '"detail":"Close only mode"}'
+    )
+    err = c._classify_http_error(exc, "/equity/orders/market", body)
+    assert isinstance(err, T212CloseOnlyError)
