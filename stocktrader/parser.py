@@ -37,6 +37,13 @@ class Setup:
         return reward / risk if risk > 0 else 0
 
 
+@dataclass
+class ParseResult:
+    setups: List[Setup]
+    skipped: int   # aantal rijen die genegeerd zijn (ongeldig/duplicaat/header)
+    matched: int   # aantal regex-matches gevonden
+
+
 _PRICE = r"\$?\s*([\d]{1,3}(?:[,\s][\d]{3})*(?:\.[\d]+)?|[\d]+\.?[\d]*)"
 # Ticker: 1-5 letters, optioneel .X (BRK.B); prefix bullets/stars weg in _normalize
 _TICKER = r"([A-Z]{1,5}(?:\.[A-Z])?)"
@@ -81,6 +88,47 @@ def _valid_setup(hold: float, break_: float, t1: float, t2: float) -> bool:
     return t2 > 0 and t2 >= t1 * 0.99
 
 
+def parse_watchlist_detailed(text: str) -> ParseResult:
+    """
+    Parst Krush's watchlist tekst naar setups + statistieken.
+
+    Returns ParseResult met setups, skipped count en matched count.
+    """
+    normalized = _normalize_watchlist_text(text)
+    setups: List[Setup] = []
+    seen: set[str] = set()
+    skipped = 0
+    matched = 0
+
+    for match in _ROW.finditer(normalized):
+        matched += 1
+        ticker = match.group(1).upper()
+        if ticker in _SKIP_WORDS:
+            skipped += 1
+            continue
+        if ticker in seen:
+            skipped += 1
+            continue
+
+        try:
+            hold   = _parse_price(match.group(2))
+            break_ = _parse_price(match.group(3))
+            t1     = _parse_price(match.group(4))
+            t2     = _parse_price(match.group(5))
+        except ValueError:
+            skipped += 1
+            continue
+
+        if not _valid_setup(hold, break_, t1, t2):
+            skipped += 1
+            continue
+
+        seen.add(ticker)
+        setups.append(Setup(ticker=ticker, hold=hold, break_=break_, t1=t1, t2=t2))
+
+    return ParseResult(setups=setups, skipped=skipped, matched=matched)
+
+
 def parse_watchlist(text: str) -> List[Setup]:
     """
     Parst Krush's watchlist tekst naar een lijst van Setups.
@@ -90,32 +138,7 @@ def parse_watchlist(text: str) -> List[Setup]:
         ASTC   48.00   52.00   60.00    70.00
         • MEHA 0.165 0.18 0.20 0.24
     """
-    normalized = _normalize_watchlist_text(text)
-    setups: List[Setup] = []
-    seen: set[str] = set()
-
-    for match in _ROW.finditer(normalized):
-        ticker = match.group(1).upper()
-        if ticker in _SKIP_WORDS:
-            continue
-        if ticker in seen:
-            continue
-        seen.add(ticker)
-
-        try:
-            hold   = _parse_price(match.group(2))
-            break_ = _parse_price(match.group(3))
-            t1     = _parse_price(match.group(4))
-            t2     = _parse_price(match.group(5))
-        except ValueError:
-            continue
-
-        if not _valid_setup(hold, break_, t1, t2):
-            continue
-
-        setups.append(Setup(ticker=ticker, hold=hold, break_=break_, t1=t1, t2=t2))
-
-    return setups
+    return parse_watchlist_detailed(text).setups
 
 
 def format_setups(setups: List[Setup]) -> str:

@@ -17,15 +17,30 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 BarHandler = Callable[..., None]
 
 _WS_BASE      = "wss://ws.finazon.io/v1"
 _DATASET      = "us_stocks_essential"
 _BACKOFF_MAX  = 60
+
+_UNSUPPORTED_TICKER_RE = re.compile(
+    r"ticker\s+([A-Z][A-Z0-9.]{0,5})\s+you have specified",
+    re.IGNORECASE,
+)
+_ALREADY_SUBSCRIBED_RE = re.compile(r"already subscribed", re.IGNORECASE)
+
+
+def _is_finazon_auth_error(msg: str) -> bool:
+    lower = msg.lower()
+    return any(
+        k in lower
+        for k in ("api key", "unauthorized", "invalid key", "authentication", "forbidden")
+    )
 
 
 class FinazonBarStream:
@@ -42,18 +57,31 @@ class FinazonBarStream:
         self._api_key = api_key
         self._dataset = dataset
         self._callbacks: Dict[str, BarHandler] = {}
+        self._callbacks_lock = threading.Lock()
+        self._skipped: Set[str] = set()
+        self._exclusion_handler: Optional[Callable[[str], None]] = None
         self._running = False
         self._ws = None
         self._ws_thread: Optional[threading.Thread] = None
 
+    def set_exclusion_handler(self, handler: Optional[Callable[[str], None]]) -> None:
+        self._exclusion_handler = handler
+
+    def get_skipped_tickers(self) -> Set[str]:
+        with self._callbacks_lock:
+            return set(self._skipped)
+
     def subscribe_bars(self, tickers: List[str], on_bar: BarHandler) -> None:
-        for ticker in tickers:
-            self._callbacks[ticker] = on_bar
+        with self._callbacks_lock:
+            for ticker in tickers:
+                self._callbacks[ticker] = on_bar
 
     def start_stream(self) -> None:
         if self._running:
             return
-        if not self._callbacks:
+        with self._callbacks_lock:
+            n = len(self._callbacks)
+        if n == 0:
             logging.warning("FinazonBarStream: geen tickers geregistreerd vóór start.")
         self._running = True
         self._ws_thread = threading.Thread(
@@ -62,7 +90,7 @@ class FinazonBarStream:
         self._ws_thread.start()
         logging.info(
             "Finazon bar-stream gestart (dataset=%s, tickers=%d)",
-            self._dataset, len(self._callbacks),
+            self._dataset, n,
         )
 
     def stop_stream(self) -> None:
@@ -103,6 +131,7 @@ class FinazonBarStream:
                 )
                 self._ws = ws
                 ws.run_forever(ping_interval=30, ping_timeout=10)
+                backoff = 5  # reset na succesvolle sessie
             except Exception as exc:
                 logging.warning("Finazon WS run_forever fout: %s", exc)
 
@@ -113,9 +142,17 @@ class FinazonBarStream:
             time.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX)
 
-    def _on_open(self, ws) -> None:
-        logging.info("Finazon WS verbonden — subscriben op %d tickers...", len(self._callbacks))
-        tickers = list(self._callbacks.keys())
+    def _send_subscribe(self, ws) -> bool:
+        with self._callbacks_lock:
+            tickers = list(self._callbacks.keys())
+        if not tickers:
+            logging.warning("Finazon: geen ondersteunde tickers meer — stream stopt.")
+            self._running = False
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return False
         payload = {
             "event": "subscribe",
             "dataset": self._dataset,
@@ -126,8 +163,16 @@ class FinazonBarStream:
         }
         try:
             ws.send(json.dumps(payload))
+            return True
         except Exception as exc:
             logging.warning("Finazon WS subscribe-send mislukt: %s", exc)
+            return False
+
+    def _on_open(self, ws) -> None:
+        with self._callbacks_lock:
+            n = len(self._callbacks)
+        logging.info("Finazon WS verbonden — subscriben op %d tickers...", n)
+        self._send_subscribe(ws)
 
     def _on_message(self, ws, raw: str) -> None:
         try:
@@ -146,9 +191,44 @@ class FinazonBarStream:
             return
 
         if status == "error":
-            logging.error(
-                "Finazon WS subscriptiefout: %s", msg.get("message", msg)
-            )
+            err_msg = str(msg.get("message", msg))
+            if _is_finazon_auth_error(err_msg):
+                logging.error("Finazon WS auth-fout: %s", err_msg)
+                self._running = False
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                return
+
+            if _ALREADY_SUBSCRIBED_RE.search(err_msg):
+                logging.debug("Finazon WS: %s", err_msg)
+                return
+
+            m = _UNSUPPORTED_TICKER_RE.search(err_msg)
+            if m:
+                bad = m.group(1).upper()
+                with self._callbacks_lock:
+                    if bad in self._skipped:
+                        return
+                    self._callbacks.pop(bad, None)
+                    self._skipped.add(bad)
+                    remaining = len(self._callbacks)
+                logging.warning(
+                    "Finazon: %s niet ondersteund — overgeslagen, %d tickers over.",
+                    bad, remaining,
+                )
+                handler = self._exclusion_handler
+                if handler is not None:
+                    try:
+                        handler(bad)
+                    except Exception as exc:
+                        logging.warning("Finazon exclusion handler: %s", exc)
+                # Geen resubscribe: geldige tickers uit hetzelfde batch-bericht
+                # zijn al actief bij Finazon.
+                return
+
+            logging.error("Finazon WS subscriptiefout: %s", err_msg)
             return
 
         if event == "heartbeat":
@@ -159,14 +239,17 @@ class FinazonBarStream:
             self._emit_bar(msg)
 
     def _on_error(self, ws, error) -> None:
-        logging.warning("Finazon WS error: %s", error)
+        # Redacteer API key uit error-berichten
+        err_str = str(error).replace(self._api_key, "***")
+        logging.warning("Finazon WS error: %s", err_str)
 
     def _on_close(self, ws, code, reason) -> None:
         logging.info("Finazon WS gesloten (code=%s, reason=%s).", code, reason)
 
     def _emit_bar(self, msg: dict) -> None:
-        ticker  = msg.get("s", "")
-        handler = self._callbacks.get(ticker)
+        ticker = msg.get("s", "")
+        with self._callbacks_lock:
+            handler = self._callbacks.get(ticker)
         if handler is None:
             return
         try:

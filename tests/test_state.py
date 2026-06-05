@@ -29,6 +29,18 @@ def test_state_store_load_save_roundtrip() -> None:
         assert loaded.cash == 100.0
 
 
+def test_state_store_corrupt_json_returns_empty() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = StateStore(tmp)
+        trade_date = date(2026, 6, 6)
+        path = Path(tmp) / f"{trade_date.isoformat()}.json"
+        path.write_text("{not valid json", encoding="utf-8")
+        loaded = store.load(trade_date, start_capital=50.0)
+        assert loaded.cash == 50.0
+        assert loaded.active is False
+        assert loaded.crashed is False
+
+
 def test_state_store_atomic_write() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         store = StateStore(tmp)

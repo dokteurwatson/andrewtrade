@@ -92,11 +92,59 @@ def test_on_message_subscription_success_logged():
     s._on_message(ws, raw)  # mag niet crashen, geen bar emitted
 
 
-def test_on_message_subscription_error_logged():
+def test_on_message_subscription_error_stops_stream():
     s = _make_stream()
+    s._running = True
     ws = MagicMock()
     raw = json.dumps({"status": "error", "message": "invalid api key"})
-    s._on_message(ws, raw)  # mag niet crashen
+    s._on_message(ws, raw)
+    assert s._running is False
+    ws.close.assert_called_once()
+
+
+def test_on_message_unsupported_ticker_drops_and_resubscribes():
+    s = _make_stream()
+    s._running = True
+    s._callbacks = {"BGMS": MagicMock(), "AAPL": MagicMock()}
+    ws = MagicMock()
+    raw = json.dumps({
+        "status": "error",
+        "message": "The ticker BGMS you have specified is unrecognized or unsupported.",
+    })
+    s._on_message(ws, raw)
+    assert s._running is True
+    assert "BGMS" not in s._callbacks
+    assert "BGMS" in s._skipped
+    assert "AAPL" in s._callbacks
+    ws.send.assert_not_called()
+
+
+def test_on_message_unsupported_ticker_calls_exclusion_handler():
+    s = _make_stream()
+    excluded: list[str] = []
+    s.set_exclusion_handler(excluded.append)
+    s._callbacks = {"BGMS": MagicMock(), "AAPL": MagicMock()}
+    ws = MagicMock()
+    raw = json.dumps({
+        "status": "error",
+        "message": "The ticker BGMS you have specified is unrecognized or unsupported.",
+    })
+    s._on_message(ws, raw)
+    assert excluded == ["BGMS"]
+    assert s.get_skipped_tickers() == {"BGMS"}
+
+
+def test_on_message_already_subscribed_is_ignored():
+    s = _make_stream()
+    s._running = True
+    ws = MagicMock()
+    raw = json.dumps({
+        "status": "error",
+        "message": "You are already subscribed to ticker: AAPL, TSLA.",
+    })
+    s._on_message(ws, raw)
+    assert s._running is True
+    ws.send.assert_not_called()
 
 
 def test_on_message_heartbeat_ignored():

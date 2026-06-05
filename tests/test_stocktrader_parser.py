@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stocktrader.parser import parse_watchlist
+from stocktrader.parser import parse_watchlist, parse_watchlist_detailed
 
 
 def test_parse_standard_table() -> None:
@@ -41,6 +41,18 @@ def test_parse_skips_header_and_invalid_rows() -> None:
     setups = parse_watchlist(text)
     assert len(setups) == 1
     assert setups[0].ticker == "GOOD"
+
+
+def test_parse_reports_skipped_rows() -> None:
+    text = """
+    STOCK HOLD BREAK TARGET TARGET2
+    BAD  1.00  0.50  2.00  3.00
+    GOOD 1.00  1.50  2.00  3.00
+    """
+    result = parse_watchlist_detailed(text)
+    assert len(result.setups) == 1
+    assert result.setups[0].ticker == "GOOD"
+    assert result.skipped >= 1
 
 
 def test_parse_equal_targets() -> None:

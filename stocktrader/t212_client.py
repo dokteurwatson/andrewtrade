@@ -28,7 +28,9 @@ import json
 import logging
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -38,6 +40,52 @@ _DEMO_BASE = "https://demo.trading212.com/api/v0"
 _LIVE_BASE = "https://live.trading212.com/api/v0"
 
 _MIN_CALL_INTERVAL = 0.25  # seconden tussen API-calls (T212 rate limits)
+_MAX_RETRIES = 3
+_CASH_CACHE_TTL = 45.0  # seconden — voorkom parallelle get_cash() spam
+
+CURRENCY_SYMBOLS: Dict[str, str] = {"USD": "$", "EUR": "€", "GBP": "£"}
+
+
+@dataclass(frozen=True)
+class T212AccountInfo:
+    cash: float
+    currency: str  # ISO 4217, account primary currency (T212 API)
+
+
+def currency_symbol(code: str) -> str:
+    return CURRENCY_SYMBOLS.get(code.upper(), f"{code.upper()} ")
+
+
+class T212Error(RuntimeError):
+    """Basis T212 API-fout."""
+
+
+class T212AuthError(T212Error):
+    """401/403 — ongeldige credentials."""
+
+
+class T212RateLimitError(T212Error):
+    """429 — rate limit bereikt."""
+
+    def __init__(self, message: str, retry_after: float = 0.0) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class T212NetworkError(T212Error):
+    """Netwerk/timeout fout — transient, retry mogelijk."""
+
+
+class T212PositionNotFoundError(T212Error):
+    """Positie niet gevonden bij broker — lokale state desync."""
+
+
+def _is_position_gone_message(msg: str) -> bool:
+    lower = msg.lower()
+    return any(
+        k in lower
+        for k in ("position", "not found", "no position", "insufficient", "does not exist")
+    )
 
 
 class T212Client:
@@ -48,30 +96,56 @@ class T212Client:
     een shortName → T212-ticker dict gebouwd (bv. AAPL → AAPL_US_EQ).
     """
 
-    def __init__(self, api_key: str, api_secret: str = "", *, demo: bool = True) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str = "",
+        *,
+        demo: bool = True,
+        extended_hours: bool = True,
+        fx_eur_usd: float = 1.08,
+        fx_gbp_usd: float = 1.27,
+        fx_buffer_pct: float = 0.03,
+    ) -> None:
         if not api_key:
             raise RuntimeError("T212_API_KEY is verplicht voor BROKER=t212")
         self._api_key    = api_key
         self._api_secret = api_secret
+        self._extended_hours = extended_hours
+        self._fx_eur_usd = fx_eur_usd
+        self._fx_gbp_usd = fx_gbp_usd
+        self._fx_buffer_pct = fx_buffer_pct
         self._base = _DEMO_BASE if demo else _LIVE_BASE
         self._mode = "DEMO" if demo else "LIVE"
         self._instrument_map: Dict[str, str] = {}  # shortName.upper() → t212_ticker
         self._price_cache: Dict[str, float] = {}
         self._last_call_ts: float = 0.0
+        self._connected = False
+        self._account_cache: Optional[T212AccountInfo] = None
+        self._cash_cache_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # Verbinding
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
+        if self._connected:
+            return
         logging.info("T212Client: verbinden met %s (%s)...", self._base, self._mode)
         self._load_instruments()
+        self._connected = True
         logging.info(
             "T212Client verbonden [%s] | %d instrumenten geladen.",
             self._mode, len(self._instrument_map),
         )
 
+    def _ensure_connected(self) -> None:
+        """Lazy connect — nodig voor is_tradable/get_cash vóór trader-start."""
+        if not self._connected:
+            self.connect()
+
     def disconnect(self) -> None:
+        self._connected = False
         logging.info("T212Client: losgekoppeld.")
 
     def bind_state(self, store: "StateStore", state: "DayState") -> None:
@@ -109,23 +183,68 @@ class T212Client:
         return t212
 
     def is_tradable(self, ticker: str) -> bool:
+        self._ensure_connected()
         return ticker.upper() in self._instrument_map
 
     # ------------------------------------------------------------------
     # Account
     # ------------------------------------------------------------------
 
-    def get_cash(self) -> float:
-        try:
-            data = self._get("/equity/account/summary")
-            cash_block = data.get("cash", data)
-            for field in ("free", "availableToTrade", "freeForStocks"):
-                val = cash_block.get(field)
-                if val is not None:
-                    return float(val)
-        except Exception as exc:
-            logging.warning("T212 get_cash mislukt: %s", exc)
-        return 0.0
+    def _parse_account_summary(self, data: dict) -> T212AccountInfo:
+        cash_block = data.get("cash", data)
+        cash = 0.0
+        for field in ("free", "availableToTrade", "freeForStocks"):
+            val = cash_block.get(field)
+            if val is not None:
+                cash = float(val)
+                break
+        currency = str(data.get("currency", "USD")).upper()
+        return T212AccountInfo(cash=cash, currency=currency)
+
+    def get_account_info(self, *, force: bool = False) -> T212AccountInfo:
+        now = time.monotonic()
+        if (
+            not force
+            and self._account_cache is not None
+            and now - self._cash_cache_ts < _CASH_CACHE_TTL
+        ):
+            return self._account_cache
+        self._ensure_connected()
+        data = self._get("/equity/account/summary")
+        info = self._parse_account_summary(data)
+        self._account_cache = info
+        self._cash_cache_ts = time.monotonic()
+        return info
+
+    def get_cash(self, *, force: bool = False) -> float:
+        return self.get_account_info(force=force).cash
+
+    def get_account_currency(self) -> str:
+        if self._account_cache is not None:
+            return self._account_cache.currency
+        return self.get_account_info().currency
+
+    def cash_in_usd(self, amount: float, *, currency: Optional[str] = None) -> float:
+        """
+        Schatting: account-saldo → USD voor share-count vóór de order.
+
+        T212 wisselt live om bij uitvoering; dit is geen conversie door ons.
+        """
+        from .fx_rates import get_rate_to_usd
+
+        ccy = (currency or self.get_account_currency()).upper()
+        rate = get_rate_to_usd(
+            ccy,
+            fallback_eur_usd=self._fx_eur_usd,
+            fallback_gbp_usd=self._fx_gbp_usd,
+            buffer_pct=self._fx_buffer_pct,
+        )
+        if ccy != "USD" and rate == 1.0:
+            logging.warning(
+                "T212: onbekende accountvaluta %s — geen FX, sizing kan afwijken.",
+                ccy,
+            )
+        return amount * rate
 
     def get_buying_power(self) -> float:
         return self.get_cash()
@@ -140,7 +259,7 @@ class T212Client:
 
     def get_latest_price(self, ticker: str) -> Optional[float]:
         cached = self._price_cache.get(ticker)
-        if cached:
+        if cached is not None and cached > 0:
             return cached
         # Fallback: probeer T212-positie als die bestaat
         try:
@@ -157,14 +276,16 @@ class T212Client:
     # Orders
     # ------------------------------------------------------------------
 
+    def _market_payload(self, t212_ticker: str, quantity: float) -> dict:
+        """T212 MarketRequest: alleen ticker, quantity (+ optioneel extendedHours)."""
+        payload: dict = {"ticker": t212_ticker, "quantity": quantity}
+        if self._extended_hours:
+            payload["extendedHours"] = True
+        return payload
+
     def buy_market(self, ticker: str, shares: int) -> str:
         t212 = self._map_ticker(ticker)
-        payload = {
-            "ticker": t212,
-            "quantity": abs(shares),
-            "type": "MARKET",
-            "timeValidity": "DAY",
-        }
+        payload = self._market_payload(t212, abs(shares))
         response = self._post("/equity/orders/market", payload)
         order_id = str(response.get("id", f"t212-buy-{ticker}-{int(time.time())}"))
         logging.info(
@@ -176,13 +297,13 @@ class T212Client:
     def sell_market(self, ticker: str, shares: int) -> str:
         t212 = self._map_ticker(ticker)
         # T212 API: negatieve quantity = verkoop
-        payload = {
-            "ticker": t212,
-            "quantity": -abs(shares),
-            "type": "MARKET",
-            "timeValidity": "DAY",
-        }
-        response = self._post("/equity/orders/market", payload)
+        payload = self._market_payload(t212, -abs(shares))
+        try:
+            response = self._post("/equity/orders/market", payload)
+        except T212Error as exc:
+            if _is_position_gone_message(str(exc)):
+                raise T212PositionNotFoundError(str(exc)) from exc
+            raise
         order_id = str(response.get("id", f"t212-sell-{ticker}-{int(time.time())}"))
         logging.info(
             "T212 SELL %s x%d [%s] → order_id=%s",
@@ -194,7 +315,7 @@ class T212Client:
         """Sluit alle open T212-posities via market sell-orders."""
         try:
             positions = self._get("/equity/positions")
-        except Exception as exc:
+        except T212Error as exc:
             logging.error("T212 close_all_positions: posities ophalen mislukt: %s", exc)
             return
 
@@ -211,15 +332,10 @@ class T212Client:
             # Reverse-lookup voor logging (niet kritiek als niet gevonden)
             short = self._reverse_ticker(t212_ticker)
             try:
-                payload = {
-                    "ticker": t212_ticker,
-                    "quantity": -abs(qty),  # negatief = verkoop
-                    "type": "MARKET",
-                    "timeValidity": "DAY",
-                }
+                payload = self._market_payload(t212_ticker, -abs(qty))
                 self._post("/equity/orders/market", payload)
                 logging.info("T212 EOD close: %s x%.4f", short or t212_ticker, qty)
-            except Exception as exc:
+            except T212Error as exc:
                 logging.error(
                     "T212 EOD close mislukt voor %s: %s", short or t212_ticker, exc
                 )
@@ -253,31 +369,78 @@ class T212Client:
         return {
             "Authorization": self._auth_header(),
             "Content-Type": "application/json",
+            "User-Agent": "stocktrader/1.0 (T212 API client)",
+            "Accept": "application/json",
         }
 
+    def _classify_http_error(self, exc: urllib.error.HTTPError, path: str, body: str) -> T212Error:
+        code = exc.code
+        msg = f"T212 {path} → HTTP {code}: {body}"
+        # Cloudflare WAF (error code 1010) ≠ ongeldige API-key
+        if "error code: 1010" in body.lower() or "cloudflare" in body.lower():
+            return T212NetworkError(
+                f"T212 {path} geblokkeerd door Cloudflare (HTTP {code}). "
+                "Mogelijk datacenter-IP of ontbrekende browser-headers."
+            )
+        if code == 401:
+            return T212AuthError(msg)
+        if code == 403:
+            return T212AuthError(msg)
+        if code == 429:
+            retry_after = 0.0
+            try:
+                retry_after = float(exc.headers.get("Retry-After", 0))
+            except (TypeError, ValueError):
+                pass
+            return T212RateLimitError(msg, retry_after=retry_after)
+        if _is_position_gone_message(body):
+            return T212PositionNotFoundError(msg)
+        return T212Error(msg)
+
+    def _request_with_retry(self, method: str, path: str, payload: Optional[dict] = None) -> any:
+        last_exc: Optional[Exception] = None
+        for attempt in range(_MAX_RETRIES):
+            self._throttle()
+            url = self._base + path
+            try:
+                if method == "GET":
+                    req = urllib.request.Request(url, headers=self._headers())
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        return json.loads(r.read())
+                data = json.dumps(payload).encode()
+                req = urllib.request.Request(
+                    url, data=data, headers=self._headers(), method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                classified = self._classify_http_error(exc, path, body)
+                if isinstance(classified, T212RateLimitError):
+                    wait = classified.retry_after or (2 ** attempt)
+                    logging.warning(
+                        "T212 rate limit %s (poging %d/%d), wacht %.1fs",
+                        path, attempt + 1, _MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+                    last_exc = classified
+                    continue
+                raise classified from exc
+            except urllib.error.URLError as exc:
+                wait = 2 ** attempt
+                logging.warning(
+                    "T212 netwerk %s (poging %d/%d): %s — retry in %.1fs",
+                    path, attempt + 1, _MAX_RETRIES, exc, wait,
+                )
+                last_exc = T212NetworkError(f"T212 {path} netwerk: {exc}")
+                time.sleep(wait)
+                continue
+        if last_exc:
+            raise last_exc
+        raise T212NetworkError(f"T212 {path}: max retries bereikt")
+
     def _get(self, path: str) -> any:
-        self._throttle()
-        url = self._base + path
-        req = urllib.request.Request(url, headers=self._headers())
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"T212 GET {path} → HTTP {exc.code}: {body}") from exc
+        return self._request_with_retry("GET", path)
 
     def _post(self, path: str, payload: dict) -> dict:
-        self._throttle()
-        url = self._base + path
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"T212 POST {path} → HTTP {exc.code}: {body}") from exc
-
-
-# urllib.parse ontbreekt zonder expliciete import in module scope
-import urllib.parse  # noqa: E402
+        return self._request_with_retry("POST", path, payload)

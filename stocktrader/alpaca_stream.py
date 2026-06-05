@@ -44,19 +44,23 @@ class AlpacaBarStream:
         self._secret = api_secret
         self._feed = feed.lower()
         self._callbacks: Dict[str, BarHandler] = {}
+        self._callbacks_lock = threading.Lock()
         self._running = False
         self._ws_thread: Optional[threading.Thread] = None
         self._ws = None
         self._authenticated = False
 
     def subscribe_bars(self, tickers: List[str], on_bar: BarHandler) -> None:
-        for ticker in tickers:
-            self._callbacks[ticker] = on_bar
+        with self._callbacks_lock:
+            for ticker in tickers:
+                self._callbacks[ticker] = on_bar
 
     def start_stream(self) -> None:
         if self._running:
             return
-        if not self._callbacks:
+        with self._callbacks_lock:
+            n = len(self._callbacks)
+        if n == 0:
             logging.warning("AlpacaBarStream: geen tickers geregistreerd vóór start.")
         self._running = True
         self._ws_thread = threading.Thread(
@@ -65,7 +69,7 @@ class AlpacaBarStream:
         self._ws_thread.start()
         logging.info(
             "Alpaca bar-stream gestart (feed=%s, tickers=%d)",
-            self._feed, len(self._callbacks),
+            self._feed, n,
         )
 
     def stop_stream(self) -> None:
@@ -107,6 +111,7 @@ class AlpacaBarStream:
                 )
                 self._ws = ws
                 ws.run_forever(ping_interval=20, ping_timeout=10)
+                backoff = 5  # reset na succesvolle sessie
             except Exception as exc:
                 logging.warning("Alpaca WS run_forever fout: %s", exc)
 
@@ -151,7 +156,8 @@ class AlpacaBarStream:
             elif srv_msg == "authenticated":
                 self._authenticated = True
                 logging.info("Alpaca WS geauthenticeerd (feed=%s).", self._feed)
-                tickers = list(self._callbacks.keys())
+                with self._callbacks_lock:
+                    tickers = list(self._callbacks.keys())
                 self._send(ws, {"action": "subscribe", "bars": tickers})
 
         elif t == "subscription":
@@ -162,7 +168,7 @@ class AlpacaBarStream:
             code = msg.get("code")
             err_msg = msg.get("msg", "")
             logging.error("Alpaca WS protocol-fout code=%s: %s", code, err_msg)
-            if code in (402, 403):
+            if code in (401, 402, 403):
                 logging.error("Alpaca auth mislukt — stream stopt.")
                 self._running = False
                 ws.close()
@@ -178,7 +184,8 @@ class AlpacaBarStream:
 
     def _emit_bar(self, msg: dict) -> None:
         ticker = msg.get("S", "")
-        handler = self._callbacks.get(ticker)
+        with self._callbacks_lock:
+            handler = self._callbacks.get(ticker)
         if handler is None:
             return
         try:

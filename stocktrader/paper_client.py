@@ -44,7 +44,8 @@ class PaperClient:
     def bind_state(self, store: "StateStore", state: "DayState") -> None:
         self._store = store
         self._state = state
-        if state.cash > 0:
+        # cash >= 0 is geldig (ook €0 na verlies); alleen negatief = niet ingesteld
+        if state.cash >= 0:
             self._cash = state.cash
             logging.info("PaperClient: cash geladen uit state: $%.2f", self._cash)
         else:
@@ -84,7 +85,7 @@ class PaperClient:
 
     def get_latest_price(self, ticker: str) -> Optional[float]:
         cached = self._price_cache.get(ticker)
-        if cached:
+        if cached is not None and cached > 0:
             return cached
         return self._yfinance_last_price(ticker)
 

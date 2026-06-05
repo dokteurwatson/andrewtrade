@@ -5,8 +5,10 @@ Persisteert naar JSON zodat een herstart geen data verliest.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
+import threading
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime
 from pathlib import Path
@@ -14,6 +16,9 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo("America/New_York")
+
+# Module-level lock: beschermt tegen concurrent writes van dashboard + trader threads
+_STATE_LOCK = threading.Lock()
 
 
 def trading_date() -> date:
@@ -54,6 +59,7 @@ class DayState:
     closed_trades: List[dict]
     active:       bool
     cash:         float = 0.0   # huidig cash saldo (gepersisteerd)
+    crashed:      bool = False  # True als trading-loop onverwacht crashte
 
     @staticmethod
     def empty(trade_date: date, start_capital: float = 0.0) -> "DayState":
@@ -64,6 +70,7 @@ class DayState:
             closed_trades=[],
             active=False,
             cash=start_capital,
+            crashed=False,
         )
 
     def get_setups(self) -> List[Setup]:
@@ -132,28 +139,39 @@ class StateStore:
         f = self._file(trade_date)
         if not f.exists():
             return DayState.empty(trade_date, start_capital)
-        with open(f) as fp:
-            data = json.load(fp)
-        # backwards compat: oude state zonder cash veld
+        try:
+            with open(f) as fp:
+                data = json.load(fp)
+        except json.JSONDecodeError as exc:
+            logging.error("State JSON corrupt (%s): %s — leeg state aangemaakt.", f, exc)
+            return DayState.empty(trade_date, start_capital)
+        # backwards compat: oude state zonder cash/crashed veld
         if "cash" not in data:
             data["cash"] = start_capital
-        return DayState(**data)
+        if "crashed" not in data:
+            data["crashed"] = False
+        try:
+            return DayState(**data)
+        except (TypeError, KeyError) as exc:
+            logging.error("State JSON ongeldig schema (%s): %s — leeg state aangemaakt.", f, exc)
+            return DayState.empty(trade_date, start_capital)
 
     def save(self, state: DayState) -> None:
-        f = self._file(date.fromisoformat(state.trade_date))
-        payload = json.dumps(asdict(state), indent=2)
-        # Atomaire write: schrijf naar tmp dan replace → geen corrupt bestand bij crash
-        fd, tmp = tempfile.mkstemp(dir=self.path, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as fp:
-                fp.write(payload)
-            os.replace(tmp, f)
-        except Exception:
+        with _STATE_LOCK:
+            f = self._file(date.fromisoformat(state.trade_date))
+            payload = json.dumps(asdict(state), indent=2)
+            # Atomaire write: schrijf naar tmp dan replace → geen corrupt bestand bij crash
+            fd, tmp = tempfile.mkstemp(dir=self.path, suffix=".tmp")
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w") as fp:
+                    fp.write(payload)
+                os.replace(tmp, f)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
     def add_setup(self, state: DayState, setup: Setup) -> None:
         state.setups.append(asdict(setup))

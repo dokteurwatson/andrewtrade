@@ -15,9 +15,16 @@ from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, render_template, request, url_for
 
 from .config import Settings
-from .market_snapshot import live_snapshots
-from .parser import parse_watchlist
+from .market_snapshot import (
+    apply_follow_status,
+    enrich_quotes_with_reference,
+    placeholder_snapshots,
+    quote_source_hint,
+    yfinance_snapshots,
+)
+from .parser import parse_watchlist_detailed
 from .state import DayState, StateStore, trading_date
+from .t212_client import T212Client, currency_symbol
 from .trader import Trader
 
 load_dotenv()
@@ -36,12 +43,83 @@ trader = Trader(settings)
 _AUTO_RESUME = os.getenv("AUTO_RESUME_TRADING", "true").lower() == "true"
 _resume_lock = threading.Lock()
 _resume_done = False
+_tradable_cache: dict[str, tuple[bool, float]] = {}
+_TRADABLE_CACHE_TTL = 60.0
+
+
+def _broker_blocked_preview(setups) -> dict[str, dict]:
+    """T212 tradable-check vóór bot-start (gecachet, voor dashboard-labels)."""
+    if settings.effective_broker() != "t212" or not setups:
+        return {}
+    now = time.monotonic()
+    out: dict[str, dict] = {}
+    for s in setups:
+        t = s.ticker
+        cached = _tradable_cache.get(t)
+        if cached and now - cached[1] < _TRADABLE_CACHE_TTL:
+            if not cached[0]:
+                out[t] = {
+                    "followed": False,
+                    "exclude_reason": "Niet verhandelbaar op T212",
+                }
+            continue
+        try:
+            ok = trader.client.is_tradable(t)
+        except Exception:
+            ok = False
+        _tradable_cache[t] = (ok, now)
+        if not ok:
+            out[t] = {
+                "followed": False,
+                "exclude_reason": "Niet verhandelbaar op T212",
+            }
+    return out
+
+
+def _follow_map(setups, *, engine_live: bool) -> dict[str, dict]:
+    if engine_live:
+        return trader.get_follow_status(setups)
+    follow = _broker_blocked_preview(setups)
+    for t, meta in trader.get_follow_status(setups).items():
+        if not meta.get("followed", True):
+            follow[t] = meta
+    return follow
+
+
+def _build_live_quotes(setups, *, engine_live: bool) -> list:
+    data_source = settings.effective_data_source()
+    if not setups:
+        return []
+    try:
+        if data_source == "yfinance":
+            rows = yfinance_snapshots(setups, settings, today())
+            for r in rows:
+                r.setdefault("followed", True)
+                r.setdefault("exclude_reason", "")
+                if r.get("last") is not None:
+                    r["last_source"] = "live"
+        elif engine_live:
+            rows = trader.get_live_quotes(setups)
+        else:
+            rows = apply_follow_status(
+                placeholder_snapshots(setups),
+                _follow_map(setups, engine_live=False),
+            )
+        return enrich_quotes_with_reference(rows)
+    except Exception as exc:
+        logging.warning("Live quotes mislukt: %s", exc)
+        return []
 
 
 def _launch_trader(state: DayState, *, reason: str) -> None:
+    if not trader.start(state):
+        state.active = False
+        store.save(state)
+        logging.warning("Trader start mislukt (%s) — state terug op inactief.", reason)
+        return
     state.active = True
+    state.crashed = False
     store.save(state)
-    trader.start(state)
     logging.info("Trader opgestart (%s).", reason)
 
 
@@ -73,17 +151,15 @@ def today() -> date:
     return trading_date()
 
 
-def load_state() -> DayState:
+def load_state(*, refresh_cash: bool = True) -> DayState:
     state = store.load(today(), settings.paper_capital)
-    if settings.effective_broker() == "t212":
+    if refresh_cash and settings.effective_broker() == "t212":
         try:
             actual_cash = trader.client.get_cash()
-            if actual_cash > 0:
+            if actual_cash >= 0:
                 store.update_cash(state, actual_cash)
         except Exception as exc:
             logging.warning("T212 cash ophalen mislukt: %s", exc)
-            if state.cash <= 0:
-                store.update_cash(state, settings.paper_capital)
     elif state.cash <= 0:
         store.update_cash(state, settings.paper_capital)
     return state
@@ -105,7 +181,10 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
     engine_live = trader.is_engine_live()
     bot_status = "inactief"
     bot_hint = ""
-    if state.active and engine_live:
+    if state.crashed and not engine_live:
+        bot_status = "gecrasht"
+        bot_hint = "Trading-loop is onverwacht gestopt. Controleer logs en start opnieuw."
+    elif state.active and engine_live:
         bot_status = "handelt"
     elif state.active:
         bot_status = "actief_zonder_engine"
@@ -114,16 +193,23 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
             "of wacht op auto-resume."
         )
 
-    live_quotes: list = []
-    quote_by_ticker: dict = {}
-    if setups:
-        try:
-            live_quotes = live_snapshots(setups, settings, today())
-            quote_by_ticker = {q["ticker"]: q for q in live_quotes}
-        except Exception as exc:
-            logging.warning("Live snapshot mislukt: %s", exc)
+    data_source = settings.effective_data_source()
+    live_quotes = _build_live_quotes(setups, engine_live=engine_live)
+    quote_by_ticker = {q["ticker"]: q for q in live_quotes}
+    excluded_tickers = [
+        q["ticker"]
+        for q in live_quotes
+        if not q.get("followed", True)
+    ]
 
     is_paper_broker = settings.effective_broker() == "paper"
+    account_currency = "USD"
+    if settings.effective_broker() == "t212" and isinstance(trader.client, T212Client):
+        try:
+            account_currency = trader.client.get_account_currency()
+        except Exception:
+            pass
+    account_currency_symbol = currency_symbol(account_currency)
 
     return dict(
         state=state,
@@ -132,11 +218,14 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
         positions=positions,
         day_pnl=day_pnl,
         today=today().isoformat(),
-        data_source=settings.effective_data_source(),
+        data_source=data_source,
+        quote_source_hint=quote_source_hint(data_source, engine_live=engine_live),
         broker_label=_broker_label(),
         is_paper_broker=is_paper_broker,
         error=error,
         warn_blocked=warn_blocked or [],
+        warn_skipped=0,
+        excluded_tickers=excluded_tickers,
         live_quotes=live_quotes,
         quote_by_ticker=quote_by_ticker,
         volume_mult=settings.volume_mult,
@@ -144,26 +233,43 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
         engine_live=engine_live,
         bot_status=bot_status,
         bot_hint=bot_hint,
+        account_currency=account_currency,
+        account_currency_symbol=account_currency_symbol,
+        stock_currency_symbol="$",
     )
 
 
 @app.route("/")
 def index():
-    warn = [t for t in request.args.get("warn_blocked", "").split(",") if t]
-    return render_template("index.html", **_render_ctx(load_state(), warn_blocked=warn))
+    warn = [t.strip().upper() for t in request.args.get("warn_blocked", "").split(",") if t.strip()]
+    ctx = _render_ctx(load_state(), warn_blocked=warn)
+    skipped = request.args.get("warn_skipped")
+    if skipped and skipped.isdigit():
+        ctx["warn_skipped"] = int(skipped)
+    else:
+        ctx["warn_skipped"] = 0
+    return render_template("index.html", **ctx)
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    if trader.is_engine_live():
+        ctx = _render_ctx(
+            load_state(),
+            error="Stop de bot eerst voordat je de watchlist wijzigt.",
+        )
+        return render_template("index.html", **ctx)
+
     text = request.form.get("watchlist", "")
-    setups = parse_watchlist(text)
+    result = parse_watchlist_detailed(text)
+    setups = result.setups
     if not setups:
         ctx = _render_ctx(load_state(), error="Geen geldige setups gevonden.")
         return render_template("index.html", **ctx)
 
     state = load_state()
     store.set_setups(state, setups)
-    logging.info("Watchlist: %d setups", len(setups))
+    logging.info("Watchlist: %d setups (%d rijen genegeerd)", len(setups), result.skipped)
 
     blocked: list[str] = []
     for s in setups:
@@ -175,6 +281,8 @@ def upload():
 
     if blocked:
         return redirect(url_for("index", warn_blocked=",".join(blocked)))
+    if result.skipped > 0:
+        return redirect(url_for("index", warn_skipped=str(result.skipped)))
     return redirect(url_for("index"))
 
 
@@ -197,6 +305,7 @@ def stop():
     trader.stop()
     state = load_state()
     state.active = False
+    state.crashed = False
     store.save(state)
     return redirect(url_for("index"))
 
@@ -273,6 +382,7 @@ def status():
     return jsonify({
         "date": state.trade_date,
         "active": state.active,
+        "crashed": state.crashed,
         "engine_live": trader.is_engine_live(),
         "data_source": settings.effective_data_source(),
         "broker": _broker_label(),
@@ -286,17 +396,20 @@ def status():
 
 @app.get("/health")
 def health():
-    state = load_state()
+    # Geen T212 API-call op elke k8s probe — voorkomt log-spam en rate limits
+    state = load_state(refresh_cash=False)
     engine_live = trader.is_engine_live()
     issues = []
-    if state.active and not engine_live:
+    if state.crashed:
+        issues.append("engine_crashed")
+    elif state.active and not engine_live:
         issues.append("engine_not_running")
     if issues:
         return jsonify({
             "status": "degraded",
             "issues": issues,
             "engine_live": engine_live,
-        }), 200
+        }), 503
     return jsonify({"status": "ok", "engine_live": engine_live})
 
 

@@ -31,11 +31,18 @@
     th { color: #666; text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a2a2a; font-weight: normal; text-transform: uppercase; font-size: 0.7rem; }
     td { padding: 6px 8px; border-bottom: 1px solid #1a1a1a; }
     tr:hover td { background: #1e1e1e; }
+    tr.row-excluded td { opacity: 0.65; }
+    tr.row-excluded td.ticker-cell { opacity: 1; }
+    .x-icon { color: #ff4444; font-weight: bold; margin-right: 4px; }
+    .last-ref { color: #888; font-size: 0.7rem; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; font-weight: bold; }
     .badge-win  { background: #004422; color: #00ff88; }
     .badge-stop { background: #440000; color: #ff4444; }
     .badge-eod  { background: #222; color: #aaa; }
+    .badge-excluded { background: #440000; color: #ff8888; }
+    .badge-wait { background: #332200; color: #ffcc00; }
     .error { background: #440000; color: #ff8888; padding: 10px 14px; border-radius: 4px; margin-bottom: 16px; font-size: 0.85rem; }
+    .warn { background: #332200; color: #ffcc00; padding: 10px 14px; border-radius: 4px; margin-bottom: 16px; font-size: 0.85rem; }
     .active-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #00ff88; margin-right: 6px; animation: pulse 1.5s infinite; }
     @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
     .controls { display: flex; gap: 10px; margin-top: 12px; }
@@ -61,13 +68,22 @@
 {% if error %}
 <div class="error">{{ error }}</div>
 {% endif %}
-{% if warn_blocked %}
-<div class="error" style="background:#332200;color:#ffcc00;">
-  Geen marktdata voor: <strong>{{ warn_blocked|join(', ') }}</strong>
+{% if warn_skipped and warn_skipped > 0 %}
+<div class="warn">{{ warn_skipped }} rij(en) genegeerd bij parsen (ongeldig formaat).</div>
+{% endif %}
+{% if excluded_tickers %}
+<div class="warn">
+  <strong>Niet gevolgd ({{ excluded_tickers|length }}):</strong>
+  {% for t in excluded_tickers %}<span class="x-icon" title="Wordt niet getrackt">✗</span>{{ t }}{% if not loop.last %}, {% endif %}{% endfor %}
+  — geen orders / geen live bars voor deze tickers.
+</div>
+{% elif warn_blocked %}
+<div class="warn">
+  Niet verhandelbaar op T212: <strong>{{ warn_blocked|join(', ') }}</strong>
 </div>
 {% endif %}
 {% if bot_hint %}
-<div class="error" style="background:#332200;color:#ffcc00;"><strong>Let op:</strong> {{ bot_hint }}</div>
+<div class="warn"><strong>Let op:</strong> {{ bot_hint }}</div>
 {% endif %}
 
 <div class="status-bar">
@@ -76,6 +92,8 @@
     <div class="stat-value">
       {% if bot_status == 'handelt' %}
         <span class="active-dot"></span><span class="green">HANDELT</span>
+      {% elif bot_status == 'gecrasht' %}
+        <span style="color:#ff4444;font-weight:bold;">GECRASHT</span>
       {% elif bot_status == 'actief_zonder_engine' %}
         <span class="yellow">ACTIEF — engine uit</span>
       {% else %}
@@ -85,7 +103,7 @@
   </div>
   <div class="stat">
     <div class="stat-label">Kapitaal</div>
-    <div class="stat-value green">${{ "%.2f"|format(state.cash) }}</div>
+    <div class="stat-value green">{{ account_currency_symbol }}{{ "%.2f"|format(state.cash) }}{% if account_currency != 'USD' %} <span class="hint">({{ account_currency }})</span>{% endif %}</div>
   </div>
   <div class="stat">
     <div class="stat-label">Data</div>
@@ -96,12 +114,16 @@
     <div class="stat-value">{{ setups|length }}</div>
   </div>
   <div class="stat">
+    <div class="stat-label">Gevolgd</div>
+    <div class="stat-value {% if excluded_tickers %}yellow{% else %}green{% endif %}">{{ setups|length - excluded_tickers|length }}</div>
+  </div>
+  <div class="stat">
     <div class="stat-label">Open posities</div>
     <div class="stat-value {% if positions %}yellow{% endif %}">{{ positions|length }}</div>
   </div>
   <div class="stat">
     <div class="stat-label">Dag PnL</div>
-    <div class="stat-value {% if day_pnl > 0 %}green{% elif day_pnl < 0 %}red{% endif %}">${{ "%.2f"|format(day_pnl) }}</div>
+    <div class="stat-value {% if day_pnl > 0 %}green{% elif day_pnl < 0 %}red{% endif %}">{{ account_currency_symbol }}{{ "%.2f"|format(day_pnl) }}</div>
   </div>
   <div class="stat">
     <div class="stat-label">Trades</div>
@@ -126,7 +148,8 @@
   <div class="card" style="grid-column: 1 / -1;">
     <h2>Broker: {{ broker_label }}</h2>
     <p class="hint">
-      Kapitaal wordt rechtstreeks uit Trading 212 geladen.
+      Kapitaal uit Trading 212 ({{ account_currency }}). US-prijzen in USD.
+      Share-count schatting via live FX; T212 wisselt zelf om bij de order.
       {% if 'LIVE' in broker_label %}
         <span class="red">⚠ LIVE modus — echte orders worden uitgevoerd.</span>
       {% else %}
@@ -152,26 +175,47 @@
     <table>
       <tr>
         <th>Ticker</th><th>Hold</th><th>Break</th><th>T1</th><th>T2</th>
-        {% if live_quotes %}<th>Last</th><th>Status</th>{% endif %}
+        <th title="Laatste prijs: live 1m-bar of referentie (pre-market / vorige slot)">Last (USD)</th><th>Status</th>
       </tr>
       {% for s in setups %}
-      {% set q = quote_by_ticker.get(s.ticker) %}
-      <tr>
-        <td><strong>{{ s.ticker }}</strong></td>
+      {% set q = quote_by_ticker.get(s.ticker, {}) %}
+      {% set excluded = not q.get('followed', True) %}
+      <tr class="{% if excluded %}row-excluded{% endif %}">
+        <td class="ticker-cell">
+          {% if excluded %}<span class="x-icon" title="{{ q.get('exclude_reason', 'Niet gevolgd') }}">✗</span>{% endif %}
+          <strong>{{ s.ticker }}</strong>
+        </td>
         <td>${{ "%.2f"|format(s.hold) }}</td>
         <td class="yellow">${{ "%.2f"|format(s.break_) }}</td>
         <td class="green">${{ "%.2f"|format(s.t1) }}</td>
         <td>${{ "%.2f"|format(s.t2) }}</td>
-        {% if live_quotes %}
-        <td>{% if q and q.last %}${{ "%.2f"|format(q.last) }}{% else %}—{% endif %}</td>
-        <td>{% if q %}{{ q.status }}{% else %}—{% endif %}</td>
-        {% endif %}
+        <td>
+          {% if q and q.last is not none %}
+            ${{ "%.2f"|format(q.last) }}
+            {% if q.last_source == 'ref' and q.last_label %}
+              <span class="last-ref">({{ q.last_label }})</span>
+            {% elif q.last_source == 'live' and q.bar_time %}
+              <span class="last-ref">(bar {{ q.bar_time }})</span>
+            {% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if excluded %}
+            <span class="badge badge-excluded">{{ q.get('exclude_reason', 'niet gevolgd') }}</span>
+          {% elif q.status == 'wacht op bar' or q.status == 'start bot' %}
+            <span class="badge badge-wait">{{ q.status }}</span>
+          {% else %}
+            {{ q.status or '—' }}
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </table>
-    {% if live_quotes %}
-    <p class="hint">Snapshots: yfinance 1m (~15 min delay). Signalen via {{ data_source }}. Vol≥ = {{ volume_mult }}× ORB.</p>
-    {% endif %}
+    <p class="hint">
+      {{ quote_source_hint }}
+      ✗ = niet gevolgd (T212 of Finazon). Last = live bar-close, anders pre-market of vorige slot.
+      Vol≥ = {{ volume_mult }}× ORB{% if orb_minutes > 0 %} ({{ orb_minutes }}m){% endif %}.
+    </p>
     <div class="controls" style="margin-top:14px">
       {% if not state.active %}
         <form method="POST" action="/start"><button type="submit" class="btn btn-green">▶ Start</button></form>
@@ -213,7 +257,7 @@
       <tr>
         <td><strong>{{ t.ticker }}</strong></td>
         <td>{{ t.shares }}x</td>
-        <td class="{% if t.pnl >= 0 %}green{% else %}red{% endif %}">${{ "%+.2f"|format(t.pnl) }}</td>
+        <td class="{% if t.pnl >= 0 %}green{% else %}red{% endif %}">{{ account_currency_symbol }}{{ "%+.2f"|format(t.pnl) }}</td>
         <td>{{ t.reason }}</td>
       </tr>
       {% endfor %}
