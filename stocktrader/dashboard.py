@@ -10,6 +10,7 @@ import os
 import threading
 import time
 from datetime import date
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, render_template, request, url_for
@@ -23,8 +24,8 @@ from .market_snapshot import (
     quote_source_hint,
     yfinance_snapshots,
 )
-from .parser import parse_watchlist_detailed
-from .state import DayState, StateStore, trading_date
+from .parser import parse_watchlist_detailed, valid_setup
+from .state import ClosedTrade, DayState, StateStore, trading_date
 from .t212_client import T212Client, currency_symbol
 from .trader import Trader
 
@@ -236,7 +237,19 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
         account_currency=account_currency,
         account_currency_symbol=account_currency_symbol,
         stock_currency_symbol="$",
+        trailing_enabled=settings.trailing_stop_enabled,
+        trail_mode=settings.trail_mode,
+        trail_activation_pct=settings.trail_activation_pct,
+        trail_distance_pct=settings.trail_distance_pct,
     )
+
+
+def _find_setup_dict(state: DayState, ticker: str) -> dict | None:
+    ticker = ticker.strip().upper()
+    for d in state.setups:
+        if d.get("ticker", "").upper() == ticker:
+            return d
+    return None
 
 
 def _active_state() -> DayState:
@@ -353,6 +366,120 @@ def update_position(ticker: str):
     logging.info(
         "Stop %s bijgewerkt via dashboard: $%.4f → $%.4f (T1=$%.2f)",
         ticker, old_hold, new_hold, target,
+    )
+    return redirect(url_for("index"))
+
+
+@app.route("/position/<ticker>/close", methods=["POST"])
+def close_position_manual(ticker: str):
+    """Markeer een positie als handmatig gesloten — synchroniseert state met broker."""
+    ticker = ticker.strip().upper()
+
+    if trader.is_engine_live():
+        return redirect(url_for("index", error="Stop de bot eerst voordat je handmatig sluit."))
+
+    state = _active_state()
+    if ticker not in state.positions:
+        return redirect(url_for("index", error=f"Geen open positie voor {ticker}."))
+
+    pos_dict = state.positions[ticker]
+    raw_price = request.form.get("exit_price", "").strip()
+    try:
+        exit_price = float(raw_price) if raw_price else float(pos_dict["entry_price"])
+    except ValueError:
+        return redirect(url_for("index", error=f"Ongeldige sluitprijs voor {ticker}."))
+
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    pnl = (exit_price - float(pos_dict["entry_price"])) * int(pos_dict["shares"])
+    trade = ClosedTrade(
+        ticker=ticker,
+        shares=int(pos_dict["shares"]),
+        entry_price=float(pos_dict["entry_price"]),
+        exit_price=exit_price,
+        entry_time=pos_dict.get("entry_time", ""),
+        exit_time=_dt.now(_ZI("America/New_York")).strftime("%H:%M"),
+        reason="MANUAL",
+        pnl=round(pnl, 2),
+    )
+    store.close_position(state, trade)
+    logging.info(
+        "Positie %s handmatig gesloten via dashboard: exit=%.4f pnl=%.2f",
+        ticker, exit_price, pnl,
+    )
+    return redirect(url_for("index"))
+
+
+@app.route("/setup/<ticker>/toggle", methods=["POST"])
+def toggle_setup(ticker: str):
+    ticker = ticker.strip().upper()
+    state = _active_state()
+    setup = _find_setup_dict(state, ticker)
+    if setup is None:
+        return redirect(url_for("index", error=f"Setup {ticker} niet gevonden."))
+
+    setup["enabled"] = not setup.get("enabled", True)
+    store.save(state)
+    label = "aan" if setup["enabled"] else "uit"
+    logging.info("Setup %s handmatig %sgeschakeld via dashboard.", ticker, label)
+    return redirect(url_for("index"))
+
+
+@app.route("/setup/<ticker>/update", methods=["POST"])
+def update_setup(ticker: str):
+    ticker = ticker.strip().upper()
+    state = _active_state()
+    setup = _find_setup_dict(state, ticker)
+    if setup is None:
+        return redirect(url_for("index", error=f"Setup {ticker} niet gevonden."))
+
+    def _float_field(name: str, fallback: float) -> float:
+        raw = request.form.get(name, "").strip()
+        if not raw:
+            return fallback
+        return float(raw)
+
+    try:
+        hold = _float_field("hold", float(setup["hold"]))
+        break_ = _float_field("break_", float(setup["break_"]))
+        t1 = _float_field("t1", float(setup["t1"]))
+        t2 = _float_field("t2", float(setup["t2"]))
+    except ValueError:
+        return redirect(url_for("index", error=f"Ongeldige prijzen voor {ticker}."))
+
+    if not valid_setup(hold, break_, t1, t2):
+        return redirect(
+            url_for(
+                "index",
+                error=f"Ongeldige levels voor {ticker}: hold < break < t1, t2 >= t1.",
+            )
+        )
+
+    if ticker in state.positions:
+        stop = float(state.positions[ticker].get("stop_price", 0))
+        if stop >= t1:
+            return redirect(
+                url_for(
+                    "index",
+                    error=f"Stop ${stop:.2f} moet onder nieuwe T1 ${t1:.2f} blijven.",
+                )
+            )
+
+    # Alle validatie geslaagd — pas nu aan
+    setup["hold"] = round(hold, 4)
+    setup["break_"] = round(break_, 4)
+    setup["t1"] = round(t1, 4)
+    setup["t2"] = round(t2, 4)
+
+    if ticker in state.positions:
+        pos = state.positions[ticker]
+        pos["target_price"] = round(t1, 4)
+        pos["t2_price"] = round(t2, 4)
+
+    store.save(state)
+    logging.info(
+        "Setup %s bijgewerkt: hold=%.4f break=%.4f t1=%.4f t2=%.4f",
+        ticker, hold, break_, t1, t2,
     )
     return redirect(url_for("index"))
 

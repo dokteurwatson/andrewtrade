@@ -31,6 +31,7 @@ from .market_snapshot import build_quote_row, quote_status
 from .notifier import Notifier
 from .parser import Setup
 from .state import ClosedTrade, DayState, Position, StateStore
+from .trailing_stop import compute_trailing_stop, trailing_allowed
 
 ET = zoneinfo.ZoneInfo("America/New_York")
 MARKET_OPEN_H  = 9
@@ -185,6 +186,12 @@ class Trader:
         out: Dict[str, dict] = {}
         for setup in setups:
             t = setup.ticker
+            if not setup.enabled:
+                out[t] = {
+                    "followed": False,
+                    "exclude_reason": "Handmatig uitgeschakeld",
+                }
+                continue
             if t in broker:
                 out[t] = {
                     "followed": False,
@@ -330,6 +337,8 @@ class Trader:
         tradable: List[Setup] = []
         blocked: List[str] = []
         for s in setups:
+            if not s.enabled:
+                continue
             try:
                 ok = self.client.is_tradable(s.ticker)
             except Exception as exc:
@@ -548,6 +557,38 @@ class Trader:
                 parts.append(f"{tkr}:{now_mono - last_t:.0f}s{blocked}")
         logging.info("Bar health (limiet=%ds, data=%s): %s", stale_sec, data_src, ", ".join(parts))
 
+    def _apply_trailing_stop(
+        self,
+        state: DayState,
+        ticker: str,
+        pos_dict: dict,
+        high: float,
+    ) -> None:
+        if not trailing_allowed(pos_dict):
+            return
+        if high >= float(pos_dict["target_price"]) - 1e-9:
+            return
+        entry = float(pos_dict["entry_price"])
+        hw = max(float(pos_dict.get("high_water") or entry), high)
+
+        new_hw, new_stop, changed = compute_trailing_stop(
+            entry=entry,
+            high_water=hw,
+            current_stop=float(pos_dict["stop_price"]),
+            target=float(pos_dict["target_price"]),
+            settings=self.settings,
+        )
+        pos_dict["high_water"] = new_hw
+        if not changed:
+            return
+        old_stop = float(pos_dict["stop_price"])
+        pos_dict["stop_price"] = new_stop
+        self.store.save(state)
+        logging.info(
+            "TRAIL %s stop %.4f → %.4f (hw=%.4f, mode=%s)",
+            ticker, old_stop, new_stop, new_hw, self.settings.trail_mode,
+        )
+
     def _on_bar(
         self,
         ticker: str,
@@ -591,10 +632,11 @@ class Trader:
             state = self._state
             setup_map = {s.ticker: s for s in state.get_setups()}
             setup = setup_map.get(ticker)
-            if setup is None:
+            if setup is None or not setup.enabled:
                 return
 
-            self._bar_count[ticker] += 1
+            if is_new_bar:
+                self._bar_count[ticker] += 1
             bar_num = self._bar_count[ticker]
 
             logging.debug(
@@ -604,7 +646,7 @@ class Trader:
             )
 
             orb_min = self.settings.orb_minutes
-            if orb_min > 0 and bar_num <= orb_min:
+            if is_new_bar and orb_min > 0 and bar_num <= orb_min:
                 self._orb_volumes[ticker].append(volume)
                 self._orb_highs[ticker] = max(self._orb_highs.get(ticker, 0.0), high)
                 if bar_num == orb_min:
@@ -614,7 +656,9 @@ class Trader:
                         "ORB klaar voor %s (avg vol=%.0f, high=%.4f)",
                         ticker, avg or 0, self._orb_highs[ticker],
                     )
-                return
+                # Open posities bewaken we ook tijdens ORB, maar geen nieuwe entries
+                if ticker not in state.get_positions():
+                    return
 
             orb_avg = orb_avg_volume(self._orb_volumes[ticker])
             orb_high = self._orb_highs.get(ticker)  # None als ORB_MINUTES=0
@@ -651,18 +695,18 @@ class Trader:
                 ticker, bar_num, bar_time, high, close, volume, setup.break_, status,
             )
 
-            if not is_new_bar:
-                return
-
             if ticker in self._data_blocked:
-                logging.info("BAR %s overgeslagen — data geblokkeerd.", ticker)
+                if is_new_bar:
+                    logging.info("BAR %s overgeslagen — data geblokkeerd.", ticker)
                 return
 
             if ticker in self._broker_blocked:
                 return
 
             if ticker in positions:
-                pos = positions[ticker]
+                pos_dict = state.positions[ticker]
+                self._apply_trailing_stop(state, ticker, pos_dict, high)
+                pos = state.get_positions()[ticker]
                 if low <= pos.stop_price:
                     reason = (
                         "T1"
@@ -681,6 +725,7 @@ class Trader:
                         pos_dict = state.positions[ticker]
                         pos_dict["stop_price"] = t1_floor
                         pos_dict["target_price"] = t2_target
+                        pos_dict["runner_active"] = True
                         self.store.save(state)
                         logging.info(
                             "T1 GERAAKT %s — stop → %.4f, target → %.4f (T2)",
@@ -702,6 +747,9 @@ class Trader:
                         reason = "T2" if runner_t2 else "T1"
                         logging.info("%s %s | high=%.4f", reason, ticker, high)
                         self._order_queue.put(("EXIT", pos, pos.target_price, reason))
+                return
+
+            if not is_new_bar:
                 return
 
             closed_today = {t.ticker for t in state.get_closed_trades()}
@@ -840,6 +888,7 @@ class Trader:
             entry_time=datetime.now(ET).strftime("%H:%M"),
             order_id=order_id,
             t2_price=setup.t2,
+            high_water=entry_price,
         )
         self.store.open_position(state, pos)
         max_loss = (entry_price - setup.hold) * shares

@@ -37,7 +37,9 @@ class Position:
     target_price: float
     entry_time:   str
     order_id:     str
-    t2_price:     float = 0.0
+    t2_price:      float = 0.0
+    high_water:    float = 0.0
+    runner_active: bool  = False
 
 
 @dataclass
@@ -83,12 +85,18 @@ class DayState:
                 break_=d["break_"],
                 t1=d["t1"],
                 t2=d["t2"],
+                enabled=d.get("enabled", True),
             ))
         return result
 
     def get_positions(self) -> Dict[str, Position]:
         return {
-            ticker: Position(**{**pos, "t2_price": pos.get("t2_price", 0.0)})
+            ticker: Position(**{
+                **pos,
+                "t2_price": pos.get("t2_price", 0.0),
+                "high_water": pos.get("high_water", pos.get("entry_price", 0.0)),
+                "runner_active": pos.get("runner_active", False),
+            })
             for ticker, pos in self.positions.items()
         }
 

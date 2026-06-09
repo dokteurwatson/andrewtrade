@@ -8,10 +8,16 @@ Docs: https://finazon.io/dataset/us_stocks_essential/docs/ws/latest
 
 WS-URL:     wss://ws.finazon.io/v1?apikey={key}
 Subscribe:  {"event":"subscribe","dataset":"us_stocks_essential",
-             "tickers":["AAPL"],"channel":"bars","frequency":"1m","aggregation":"1m"}
+             "tickers":["AAPL"],"channel":"bars","frequency":"10s","aggregation":"1m"}
 Bar-bericht:{"s":"AAPL","t":1699540020,"o":220.06,"h":220.13,"l":219.92,"c":219.96,"v":4572,...}
 
-Bars worden verzonden bij elke minuut-grens (frequency=1m).
+Met frequency="10s" (default) ontvangt de stream elke 10s een bijgewerkte 1m-bar.
+Berichten met hetzelfde "t" (bar-timestamp) zijn snapshots van dezelfde lopende minuut;
+is_new_bar=True alleen bij de eerste ontvangst van een nieuwe "t".
+
+Limieten Finazon: 100 berichten/min per connectie.
+  frequency=10s → 6 berichten/min per ticker → max ~16 tickers per connectie.
+  frequency=1s  → 60 berichten/min per ticker → max 1 ticker per connectie.
 """
 from __future__ import annotations
 
@@ -27,6 +33,7 @@ BarHandler = Callable[..., None]
 _WS_BASE      = "wss://ws.finazon.io/v1"
 _DATASET      = "us_stocks_essential"
 _BACKOFF_MAX  = 60
+_VALID_FREQUENCIES = {"1s", "10s", "1m"}
 
 _UNSUPPORTED_TICKER_RE = re.compile(
     r"ticker\s+([A-Z][A-Z0-9.]{0,5})\s+you have specified",
@@ -49,13 +56,24 @@ class FinazonBarStream:
     Zelfde interface als YfinanceBarStream / PolygonBarStream / AlpacaBarStream.
     """
 
-    def __init__(self, api_key: str, dataset: str = _DATASET) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        dataset: str = _DATASET,
+        frequency: str = "10s",
+    ) -> None:
         if not api_key:
             raise RuntimeError(
                 "FINAZON_API_KEY is verplicht voor DATA_SOURCE=finazon"
             )
+        if frequency not in _VALID_FREQUENCIES:
+            raise ValueError(
+                f"Ongeldige FINAZON_FREQUENCY '{frequency}'. "
+                f"Kies uit: {', '.join(sorted(_VALID_FREQUENCIES))}"
+            )
         self._api_key = api_key
         self._dataset = dataset
+        self._frequency = frequency
         self._callbacks: Dict[str, BarHandler] = {}
         self._callbacks_lock = threading.Lock()
         self._skipped: Set[str] = set()
@@ -65,6 +83,8 @@ class FinazonBarStream:
         self._running = False
         self._ws = None
         self._ws_thread: Optional[threading.Thread] = None
+        # Snapshot-tracking: laatste bar-timestamp per ticker
+        self._snapshot_ts: Dict[str, int] = {}
 
     def set_exclusion_handler(self, handler: Optional[Callable[[str], None]]) -> None:
         self._exclusion_handler = handler
@@ -87,14 +107,15 @@ class FinazonBarStream:
             logging.warning("FinazonBarStream: geen tickers geregistreerd vóór start.")
         self._first_bar_logged.clear()
         self._heartbeat_logged = False
+        self._snapshot_ts.clear()
         self._running = True
         self._ws_thread = threading.Thread(
             target=self._run_ws, daemon=True, name="finazon-ws"
         )
         self._ws_thread.start()
         logging.info(
-            "Finazon bar-stream gestart (dataset=%s, tickers=%d)",
-            self._dataset, n,
+            "Finazon bar-stream gestart (dataset=%s, frequency=%s, tickers=%d)",
+            self._dataset, self._frequency, n,
         )
 
     def stop_stream(self) -> None:
@@ -162,7 +183,7 @@ class FinazonBarStream:
             "dataset": self._dataset,
             "tickers": tickers,
             "channel": "bars",
-            "frequency": "1m",
+            "frequency": self._frequency,
             "aggregation": "1m",
         }
         try:
@@ -259,14 +280,26 @@ class FinazonBarStream:
             handler = self._callbacks.get(ticker)
         if handler is None:
             return
-        if ticker and ticker not in self._first_bar_logged:
+
+        bar_ts = int(msg["t"]) if "t" in msg else None
+
+        # is_new_bar=True voor de eerste ontvangst van een nieuwe minuut-timestamp.
+        # Snapshots van dezelfde lopende minuut (zelfde bar_ts) → is_new_bar=False.
+        if bar_ts is not None:
+            prev_ts = self._snapshot_ts.get(ticker)
+            is_new_bar = prev_ts != bar_ts
+            self._snapshot_ts[ticker] = bar_ts
+        else:
+            is_new_bar = True
+
+        if is_new_bar and ticker not in self._first_bar_logged:
             self._first_bar_logged.add(ticker)
             logging.info(
                 "Finazon eerste bar: %s C=%.4f V=%.0f",
                 ticker, float(msg.get("c", 0)), float(msg.get("v", 0)),
             )
+
         try:
-            bar_ts = int(msg["t"]) if "t" in msg else None
             handler(
                 ticker,
                 float(msg["o"]),
@@ -274,7 +307,7 @@ class FinazonBarStream:
                 float(msg["l"]),
                 float(msg["c"]),
                 float(msg["v"]),
-                True,
+                is_new_bar,
                 bar_ts=bar_ts,
             )
         except Exception as exc:

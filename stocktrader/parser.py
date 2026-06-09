@@ -19,6 +19,7 @@ class Setup:
     break_: float
     t1:     float
     t2:     float
+    enabled: bool = True
 
     def risk_pct(self) -> float:
         """Verlies als % van break prijs bij stop."""
@@ -81,7 +82,7 @@ def _parse_price(raw: str) -> float:
     return float(cleaned)
 
 
-def _valid_setup(hold: float, break_: float, t1: float, t2: float) -> bool:
+def valid_setup(hold: float, break_: float, t1: float, t2: float) -> bool:
     if not (hold > 0 and break_ > hold and t1 > break_):
         return False
     # T2 mag gelijk of hoger zijn dan T1; soms staat alleen één target dubbel
@@ -119,7 +120,7 @@ def parse_watchlist_detailed(text: str) -> ParseResult:
             skipped += 1
             continue
 
-        if not _valid_setup(hold, break_, t1, t2):
+        if not valid_setup(hold, break_, t1, t2):
             skipped += 1
             continue
 

@@ -32,7 +32,18 @@ def test_init_ok():
     s = _make_stream()
     assert s._api_key == "test_key"
     assert s._dataset == "us_stocks_essential"
+    assert s._frequency == "10s"
     assert s._running is False
+
+
+def test_init_custom_frequency():
+    s = FinazonBarStream(api_key="k", frequency="1m")
+    assert s._frequency == "1m"
+
+
+def test_init_invalid_frequency():
+    with pytest.raises(ValueError, match="FINAZON_FREQUENCY"):
+        FinazonBarStream(api_key="k", frequency="5s")
 
 
 def test_custom_dataset():
@@ -67,7 +78,7 @@ def test_on_open_sends_subscribe():
     assert payload["dataset"] == "us_stocks_essential"
     assert set(payload["tickers"]) == {"AAPL", "TSLA"}
     assert payload["channel"] == "bars"
-    assert payload["frequency"] == "1m"
+    assert payload["frequency"] == "10s"
     assert payload["aggregation"] == "1m"
 
 
@@ -269,3 +280,75 @@ def test_ws_url_contains_apikey():
     expected_url = "wss://ws.finazon.io/v1?apikey=my_secret_key"
     from stocktrader.finazon_stream import _WS_BASE
     assert f"{_WS_BASE}?apikey=my_secret_key" == expected_url
+
+
+# ---------------------------------------------------------------------------
+# Snapshot-tracking: is_new_bar per bar-timestamp
+# ---------------------------------------------------------------------------
+
+def _bar_msg(ticker: str, ts: int, **kwargs) -> dict:
+    base = {"s": ticker, "t": ts, "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.0, "v": 500}
+    base.update(kwargs)
+    return base
+
+
+def test_first_message_for_ts_is_new_bar():
+    """Eerste bericht voor een timestamp is altijd is_new_bar=True."""
+    s = _make_stream()
+    received: list = []
+    s.subscribe_bars(["AAPL"], lambda *a, **kw: received.append((a, kw)))
+    s._emit_bar(_bar_msg("AAPL", ts=1000))
+    assert len(received) == 1
+    _args, kw = received[0]
+    assert kw.get("bar_ts") == 1000
+    # is_new_bar is positional arg 7 (index 6 in args tuple after ticker,o,h,l,c,v)
+    assert _args[6] is True
+
+
+def test_same_ts_is_snapshot():
+    """Zelfde timestamp als vorige → is_new_bar=False (snapshot)."""
+    s = _make_stream()
+    received: list = []
+    s.subscribe_bars(["AAPL"], lambda *a, **kw: received.append(a[6]))
+    s._emit_bar(_bar_msg("AAPL", ts=1000))
+    s._emit_bar(_bar_msg("AAPL", ts=1000))  # snapshot
+    s._emit_bar(_bar_msg("AAPL", ts=1000))  # snapshot
+    assert received == [True, False, False]
+
+
+def test_new_ts_after_snapshot_is_new_bar():
+    """Na snapshots: nieuwe timestamp → is_new_bar=True weer."""
+    s = _make_stream()
+    received: list = []
+    s.subscribe_bars(["AAPL"], lambda *a, **kw: received.append(a[6]))
+    s._emit_bar(_bar_msg("AAPL", ts=1000))
+    s._emit_bar(_bar_msg("AAPL", ts=1000))
+    s._emit_bar(_bar_msg("AAPL", ts=1060))  # nieuwe minuut
+    assert received == [True, False, True]
+
+
+def test_snapshot_ts_tracked_per_ticker():
+    """Snapshot-tracking is per ticker onafhankelijk."""
+    s = _make_stream()
+    aapl_received: list = []
+    tsla_received: list = []
+    s.subscribe_bars(["AAPL"], lambda *a, **kw: aapl_received.append(a[6]))
+    s.subscribe_bars(["TSLA"], lambda *a, **kw: tsla_received.append(a[6]))
+    s._emit_bar(_bar_msg("AAPL", ts=1000))
+    s._emit_bar(_bar_msg("TSLA", ts=1000))  # zelfde ts maar ander ticker: ook new_bar
+    s._emit_bar(_bar_msg("AAPL", ts=1000))  # snapshot voor AAPL
+    assert aapl_received == [True, False]
+    assert tsla_received == [True]
+
+
+def test_snapshot_ts_cleared_on_start_stream():
+    """start_stream reset snapshot-state zodat herstarten correct werkt."""
+    s = _make_stream()
+    s._snapshot_ts["AAPL"] = 9999
+    s.subscribe_bars(["AAPL"], MagicMock())
+    with patch.object(s, "_ws_thread") as _:
+        s._first_bar_logged.clear()
+        s._heartbeat_logged = False
+        s._snapshot_ts.clear()
+        s._running = True
+    assert "AAPL" not in s._snapshot_ts

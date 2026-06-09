@@ -39,7 +39,8 @@ class Settings:
     alpaca_api_secret: str
     alpaca_data_feed:  str   # iex (gratis) | sip (betaald)
 
-    finazon_api_key: str     # us_stocks_essential dataset (~$19/mnd non-pro)
+    finazon_api_key:       str   # us_stocks_essential dataset (~$19/mnd non-pro)
+    finazon_frequency:     str   # 1s | 10s | 1m — hoe vaak snapshots worden gestuurd
 
     broker:          str     # paper | t212
     t212_api_key:    str
@@ -55,6 +56,12 @@ class Settings:
 
     volume_mult:       float
     orb_minutes:       int
+
+    trailing_stop_enabled: bool
+    trail_mode:            str    # trail | steps
+    trail_activation_pct:  float
+    trail_distance_pct:    float
+    trail_steps:           str    # bijv. "5:0,10:5,15:10"
 
     cash_reserve_pct:        float
     risk_threshold_usd:      float
@@ -117,6 +124,7 @@ class Settings:
             alpaca_api_secret=_str("ALPACA_API_SECRET", ""),
             alpaca_data_feed=_str("ALPACA_DATA_FEED", "iex").lower(),
             finazon_api_key=_str("FINAZON_API_KEY", ""),
+            finazon_frequency=_str("FINAZON_FREQUENCY", "10s").lower(),
             broker=_str("BROKER", "paper").lower(),
             t212_api_key=_str("T212_API_KEY", ""),
             t212_api_secret=_str("T212_API_SECRET", ""),
@@ -129,6 +137,11 @@ class Settings:
             max_shares_per_order=_int("MAX_SHARES_PER_ORDER", 0),
             volume_mult=_float("VOLUME_MULT", 2.0),
             orb_minutes=_int("ORB_MINUTES", 0),
+            trailing_stop_enabled=_bool("TRAILING_STOP_ENABLED", True),
+            trail_mode=_str("TRAIL_MODE", "trail").lower(),
+            trail_activation_pct=_float("TRAIL_ACTIVATION_PCT", 5.0),
+            trail_distance_pct=_float("TRAIL_DISTANCE_PCT", 3.0),
+            trail_steps=_str("TRAIL_STEPS", "5:0,10:5,15:10"),
             cash_reserve_pct=_float("CASH_RESERVE_PCT", 0.02),
             risk_threshold_usd=_float("RISK_THRESHOLD_USD", 200.0),
             risk_per_trade_pct=_float("RISK_PER_TRADE_PCT", 0.02),

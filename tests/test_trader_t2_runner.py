@@ -21,6 +21,7 @@ def _settings(**kwargs) -> Settings:
         alpaca_api_secret="",
         alpaca_data_feed="iex",
         finazon_api_key="k",
+        finazon_frequency="10s",
         broker="paper",
         t212_api_key="",
         t212_api_secret="",
@@ -33,6 +34,11 @@ def _settings(**kwargs) -> Settings:
         max_shares_per_order=0,
         volume_mult=2.0,
         orb_minutes=0,
+        trailing_stop_enabled=False,
+        trail_mode="trail",
+        trail_activation_pct=5.0,
+        trail_distance_pct=3.0,
+        trail_steps="5:0,10:5,15:10",
         cash_reserve_pct=0.02,
         risk_threshold_usd=200.0,
         risk_per_trade_pct=0.02,
@@ -101,6 +107,7 @@ def test_t1_hit_promotes_to_t2_runner(mock_broker, mock_stream) -> None:
     pos = trader._state.positions["STAK"]
     assert pos["stop_price"] == 4.50
     assert pos["target_price"] == 5.00
+    assert pos["runner_active"] is True
     trader.store.save.assert_called_once()
     assert trader._order_queue.qsize() == 0
 

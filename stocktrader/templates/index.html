@@ -50,6 +50,9 @@
     .hold-form { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
     .hold-input { width: 72px; background: #0d0d0d; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 4px 6px; font-family: 'Courier New', monospace; font-size: 0.8rem; }
     .btn-sm { padding: 3px 8px; font-size: 0.7rem; }
+    .setup-input { width: 58px; background: #0d0d0d; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 3px 4px; font-family: 'Courier New', monospace; font-size: 0.75rem; }
+    .setup-form { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }
+    .row-disabled td { opacity: 0.55; }
   </style>
 </head>
 <body>
@@ -177,21 +180,27 @@
     {% if setups %}
     <table>
       <tr>
-        <th>Ticker</th><th>Hold</th><th>Break</th><th>T1</th><th>T2</th>
-        <th title="Laatste prijs: live 1m-bar of referentie (pre-market / vorige slot)">Last (USD)</th><th>Status</th>
+        <th>Ticker</th><th colspan="4">Levels (Hold / Break / T1 / T2)</th>
+        <th title="Laatste prijs: live 1m-bar of referentie (pre-market / vorige slot)">Last (USD)</th><th>Status</th><th>Actie</th>
       </tr>
       {% for s in setups %}
       {% set q = quote_by_ticker.get(s.ticker, {}) %}
       {% set excluded = not q.get('followed', True) %}
-      <tr class="{% if excluded %}row-excluded{% endif %}">
+      {% set manual_off = not s.enabled %}
+      <tr class="{% if excluded %}row-excluded{% endif %}{% if manual_off %} row-disabled{% endif %}">
         <td class="ticker-cell">
           {% if excluded %}<span class="x-icon" title="{{ q.get('exclude_reason', 'Niet gevolgd') }}">✗</span>{% endif %}
           <strong>{{ s.ticker }}</strong>
         </td>
-        <td>${{ "%.2f"|format(s.hold) }}</td>
-        <td class="yellow">${{ "%.2f"|format(s.break_) }}</td>
-        <td class="green">${{ "%.2f"|format(s.t1) }}</td>
-        <td>${{ "%.2f"|format(s.t2) }}</td>
+        <td colspan="4">
+          <form method="POST" action="{{ url_for('update_setup', ticker=s.ticker) }}" class="setup-form">
+            <input type="number" name="hold" class="setup-input" step="0.01" min="0.01" value="{{ '%.2f'|format(s.hold) }}" title="Hold">
+            <input type="number" name="break_" class="setup-input" step="0.01" min="0.01" value="{{ '%.2f'|format(s.break_) }}" title="Break">
+            <input type="number" name="t1" class="setup-input" step="0.01" min="0.01" value="{{ '%.2f'|format(s.t1) }}" title="T1">
+            <input type="number" name="t2" class="setup-input" step="0.01" min="0.01" value="{{ '%.2f'|format(s.t2) }}" title="T2">
+            <button type="submit" class="btn btn-green btn-sm">Opslaan</button>
+          </form>
+        </td>
         <td>
           {% if q and q.last is not none %}
             ${{ "%.2f"|format(q.last) }}
@@ -211,13 +220,25 @@
             {{ q.status or '—' }}
           {% endif %}
         </td>
+        <td>
+          <form method="POST" action="{{ url_for('toggle_setup', ticker=s.ticker) }}" style="display:inline">
+            {% if s.enabled %}
+              <button type="submit" class="btn btn-red btn-sm" title="Stop met volgen">Uit</button>
+            {% else %}
+              <button type="submit" class="btn btn-green btn-sm" title="Weer volgen">Aan</button>
+            {% endif %}
+          </form>
+        </td>
       </tr>
       {% endfor %}
     </table>
     <p class="hint">
       {{ quote_source_hint }}
-      ✗ = niet gevolgd (T212 of Finazon). Last = live bar-close, anders pre-market of vorige slot.
+      ✗ = niet gevolgd (T212, Finazon of handmatig uit). Bewerk Hold/Break/T1/T2 live; open posities worden mee gesynchroniseerd.
       Vol≥ = {{ volume_mult }}× ORB{% if orb_minutes > 0 %} ({{ orb_minutes }}m){% endif %}.
+      {% if trailing_enabled %}
+        Trailing stop: {{ trail_mode }} (actief vanaf +{{ trail_activation_pct }}%{% if trail_mode == 'trail' %}, {{ trail_distance_pct }}% onder high{% endif %}).
+      {% endif %}
     </p>
     <div class="controls" style="margin-top:14px">
       {% if not state.active %}
@@ -235,8 +256,9 @@
     <h2>Open posities</h2>
     {% if positions %}
     <table>
-      <tr><th>Ticker</th><th>Aandelen</th><th>Entry</th><th>Stop (hold)</th><th>T1</th><th>T2</th></tr>
+      <tr><th>Ticker</th><th>Aandelen</th><th>Entry</th><th>Stop</th><th>T1 / T2</th><th>High</th><th>Handmatig sluiten</th></tr>
       {% for ticker, pos in positions.items() %}
+      {% set setup_row = setups | selectattr('ticker', 'equalto', ticker) | first %}
       <tr data-entry="{{ pos.entry_price }}">
         <td><strong>{{ ticker }}</strong></td>
         <td>{{ pos.shares }}x</td>
@@ -248,15 +270,43 @@
             <button type="button" class="btn btn-gray btn-sm pct-btn" data-pct="10">+10%</button>
             <button type="button" class="btn btn-gray btn-sm pct-btn" data-pct="20">+20%</button>
             <button type="button" class="btn btn-gray btn-sm pct-btn" data-pct="30">+30%</button>
-            <button type="submit" class="btn btn-green btn-sm">Bijwerken</button>
+            <button type="submit" class="btn btn-green btn-sm">Bijw.</button>
           </form>
         </td>
-        <td class="green">${{ "%.2f"|format(pos.target_price) }}</td>
-        <td>${{ "%.2f"|format(pos.t2_price) }}</td>
+        <td class="green">
+          {% if setup_row %}
+          <form method="POST" action="{{ url_for('update_setup', ticker=ticker) }}" class="hold-form">
+            <input type="hidden" name="hold" value="{{ '%.2f'|format(setup_row.hold) }}">
+            <input type="hidden" name="break_" value="{{ '%.2f'|format(setup_row.break_) }}">
+            <input type="number" name="t1" class="hold-input" step="0.01" value="{{ '%.2f'|format(pos.target_price) }}">
+            <input type="number" name="t2" class="hold-input" step="0.01" value="{{ '%.2f'|format(pos.t2_price) }}">
+            <button type="submit" class="btn btn-green btn-sm">Bijw.</button>
+          </form>
+          {% else %}
+            T1 ${{ "%.2f"|format(pos.target_price) }} / T2 ${{ "%.2f"|format(pos.t2_price) }}
+          {% endif %}
+        </td>
+        <td class="hint">${{ "%.2f"|format(pos.high_water or pos.entry_price) }}</td>
+        <td>
+          {% if not state.active %}
+          <form method="POST" action="{{ url_for('close_position_manual', ticker=ticker) }}" class="hold-form">
+            <input type="number" name="exit_price" class="hold-input" step="0.01" min="0.01"
+                   value="{{ '%.2f'|format(pos.entry_price) }}" title="Sluitprijs">
+            <button type="submit" class="btn btn-red btn-sm"
+                    onclick="return confirm('Positie {{ ticker }} handmatig sluiten?')">Sluit</button>
+          </form>
+          {% else %}
+            <span class="hint">stop bot eerst</span>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </table>
-    <p class="hint">Stop aanpassen: typ een prijs of gebruik +10/20/30% van entry om winst vast te zetten. T1/T2 blijven uit de setup.</p>
+    <p class="hint">
+      Stop handmatig of automatisch via trailing stop{% if trailing_enabled %} ({{ trail_mode }}, +{{ trail_activation_pct }}%){% endif %}.
+      T1/T2 wijzigen werkt live; sync met setup-tabel.
+      Positie al gesloten bij broker maar staat nog open hier? Voer de sluitprijs in en klik Sluit (bot moet gestopt zijn).
+    </p>
     {% else %}
     <p class="hint">Geen open posities.</p>
     {% endif %}

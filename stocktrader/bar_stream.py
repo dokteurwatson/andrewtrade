@@ -183,7 +183,10 @@ def build_bar_stream(settings: "Settings"):
 
     if src == "finazon":
         from .finazon_stream import FinazonBarStream
-        return FinazonBarStream(api_key=settings.finazon_api_key)
+        return FinazonBarStream(
+            api_key=settings.finazon_api_key,
+            frequency=settings.finazon_frequency,
+        )
 
     if src == "alpaca":
         from .alpaca_stream import AlpacaBarStream
