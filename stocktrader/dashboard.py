@@ -138,7 +138,11 @@ def today() -> date:
 
 def load_state(*, refresh_cash: bool = True) -> DayState:
     state = store.load(today(), settings.paper_capital)
-    if refresh_cash and settings.effective_broker() == "t212":
+    if (
+        refresh_cash
+        and settings.effective_broker() == "t212"
+        and not trader.is_engine_live()
+    ):
         try:
             from .t212_client import T212Client, T212RateLimitError
 
@@ -235,11 +239,19 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
     )
 
 
+def _active_state() -> DayState:
+    """State uit draaiende engine, anders van schijf."""
+    if trader.is_engine_live() and trader._state is not None:
+        return trader._state
+    return load_state(refresh_cash=False)
+
+
 @app.route("/")
 def index():
     warn = [t.strip().upper() for t in request.args.get("warn_blocked", "").split(",") if t.strip()]
-    # Geen T212/FX op page load — voorkomt hang bij parallel trader-start.
-    ctx = _render_ctx(load_state(refresh_cash=True), warn_blocked=warn)
+    err = request.args.get("error", "").strip()
+    # Geen sync T212 op page load als bot draait — voorkomt lock/rate-limit hang.
+    ctx = _render_ctx(_active_state(), warn_blocked=warn, error=err)
     skipped = request.args.get("warn_skipped")
     if skipped and skipped.isdigit():
         ctx["warn_skipped"] = int(skipped)
@@ -304,6 +316,44 @@ def stop():
     state.active = False
     state.crashed = False
     store.save(state)
+    return redirect(url_for("index"))
+
+
+@app.route("/position/<ticker>/update", methods=["POST"])
+def update_position(ticker: str):
+    """Stop (hold) van een open positie live bijwerken — winst vastzetten."""
+    ticker = ticker.strip().upper()
+    state = _active_state()
+
+    if ticker not in state.positions:
+        return redirect(url_for("index", error=f"Geen open positie voor {ticker}."))
+
+    raw_hold = request.form.get("hold", "").strip()
+    try:
+        new_hold = float(raw_hold)
+    except ValueError:
+        return redirect(url_for("index", error=f"Ongeldige stop-prijs voor {ticker}."))
+
+    pos = state.positions[ticker]
+    target = float(pos["target_price"])
+
+    if new_hold <= 0:
+        return redirect(url_for("index", error="Stop moet groter dan 0 zijn."))
+    if new_hold >= target:
+        return redirect(
+            url_for(
+                "index",
+                error=f"Stop ${new_hold:.2f} moet onder T1 ${target:.2f} blijven.",
+            )
+        )
+
+    old_hold = float(pos.get("stop_price", 0))
+    pos["stop_price"] = round(new_hold, 4)
+    store.save(state)
+    logging.info(
+        "Stop %s bijgewerkt via dashboard: $%.4f → $%.4f (T1=$%.2f)",
+        ticker, old_hold, new_hold, target,
+    )
     return redirect(url_for("index"))
 
 

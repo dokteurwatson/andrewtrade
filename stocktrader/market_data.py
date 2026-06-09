@@ -42,6 +42,20 @@ def fetch_1m(ticker: str, trade_date: date) -> Optional[pd.DataFrame]:
     return df if not df.empty else None
 
 
+def in_regular_session(
+    now: datetime,
+    *,
+    open_h: int = 9,
+    open_m: int = 30,
+    close_h: int = 15,
+    close_m: int = 55,
+) -> bool:
+    """US reguliere sessie 09:30–15:55 ET (bot handelsvenster)."""
+    after_open = now.hour > open_h or (now.hour == open_h and now.minute >= open_m)
+    before_close = now.hour < close_h or (now.hour == close_h and now.minute < close_m)
+    return after_open and before_close
+
+
 def orb_avg_volume(volumes: List[float]) -> Optional[float]:
     """Gemiddeld volume over ORB-bars; None als lijst leeg is."""
     if not volumes:

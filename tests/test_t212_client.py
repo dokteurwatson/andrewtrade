@@ -12,6 +12,7 @@ from stocktrader.t212_client import (
     T212AuthError,
     T212Client,
     T212CloseOnlyError,
+    T212ExtendedHoursNotAllowedError,
     T212NetworkError,
     T212PositionNotFoundError,
     T212RateLimitError,
@@ -369,3 +370,24 @@ def test_classify_http_error_close_only():
     )
     err = c._classify_http_error(exc, "/equity/orders/market", body)
     assert isinstance(err, T212CloseOnlyError)
+
+
+def test_classify_http_error_extended_hours_not_allowed():
+    import urllib.error
+    c = _make_client()
+    exc = urllib.error.HTTPError(
+        url="http://test", code=400, msg="Bad Request", hdrs={}, fp=None
+    )
+    body = (
+        '{"type":"/api-errors/extended-hours-trading-not-allowed",'
+        '"detail":"Extended hours trading is not allowed for this account"}'
+    )
+    err = c._classify_http_error(exc, "/equity/orders/market", body)
+    assert isinstance(err, T212ExtendedHoursNotAllowedError)
+
+
+def test_disable_extended_hours():
+    c = T212Client(api_key="k", extended_hours=True)
+    assert c.extended_hours_enabled()
+    c.disable_extended_hours()
+    assert not c.extended_hours_enabled()

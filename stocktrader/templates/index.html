@@ -47,6 +47,9 @@
     @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
     .controls { display: flex; gap: 10px; margin-top: 12px; }
     .hint { color: #555; font-size: 0.75rem; margin-top: 8px; }
+    .hold-form { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .hold-input { width: 72px; background: #0d0d0d; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 4px 6px; font-family: 'Courier New', monospace; font-size: 0.8rem; }
+    .btn-sm { padding: 3px 8px; font-size: 0.7rem; }
   </style>
 </head>
 <body>
@@ -232,17 +235,28 @@
     <h2>Open posities</h2>
     {% if positions %}
     <table>
-      <tr><th>Ticker</th><th>Aandelen</th><th>Entry</th><th>Stop</th><th>Target</th></tr>
+      <tr><th>Ticker</th><th>Aandelen</th><th>Entry</th><th>Stop (hold)</th><th>T1</th><th>T2</th></tr>
       {% for ticker, pos in positions.items() %}
-      <tr>
+      <tr data-entry="{{ pos.entry_price }}">
         <td><strong>{{ ticker }}</strong></td>
         <td>{{ pos.shares }}x</td>
         <td>${{ "%.2f"|format(pos.entry_price) }}</td>
-        <td class="red">${{ "%.2f"|format(pos.stop_price) }}</td>
+        <td>
+          <form method="POST" action="{{ url_for('update_position', ticker=ticker) }}" class="hold-form">
+            <input type="number" name="hold" class="hold-input" step="0.01" min="0.01"
+                   value="{{ '%.2f'|format(pos.stop_price) }}" required>
+            <button type="button" class="btn btn-gray btn-sm pct-btn" data-pct="10">+10%</button>
+            <button type="button" class="btn btn-gray btn-sm pct-btn" data-pct="20">+20%</button>
+            <button type="button" class="btn btn-gray btn-sm pct-btn" data-pct="30">+30%</button>
+            <button type="submit" class="btn btn-green btn-sm">Bijwerken</button>
+          </form>
+        </td>
         <td class="green">${{ "%.2f"|format(pos.target_price) }}</td>
+        <td>${{ "%.2f"|format(pos.t2_price) }}</td>
       </tr>
       {% endfor %}
     </table>
+    <p class="hint">Stop aanpassen: typ een prijs of gebruik +10/20/30% van entry om winst vast te zetten. T1/T2 blijven uit de setup.</p>
     {% else %}
     <p class="hint">Geen open posities.</p>
     {% endif %}
@@ -269,6 +283,19 @@
 
 </div>
 
+<script>
+document.querySelectorAll('.pct-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const row = btn.closest('tr');
+    const entry = parseFloat(row.dataset.entry);
+    const pct = parseFloat(btn.dataset.pct);
+    const input = row.querySelector('.hold-input');
+    if (!isNaN(entry) && input) {
+      input.value = (entry * (1 + pct / 100)).toFixed(2);
+    }
+  });
+});
+</script>
 {% if state.active %}
 <script>setTimeout(() => location.reload(), 15000);</script>
 {% endif %}

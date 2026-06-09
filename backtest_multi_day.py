@@ -434,6 +434,8 @@ def run_day(
     data: Dict[str, Optional[pd.DataFrame]],
     capital: float,
     orb_minutes: int = 0,
+    *,
+    t2_runner: bool = True,
 ) -> tuple[float, List[TradeResult]]:
     """
     Simuleert één handelsdag met één cash pool.
@@ -508,6 +510,9 @@ def run_day(
                     "shares":      shares,
                     "spend":       spend,
                     "vol_mult":    vol_mult,
+                    "stop":        setup.hold,
+                    "target":      setup.t1,
+                    "t2":          setup.t2,
                 }
         else:
             pos = positions[ticker]
@@ -533,10 +538,29 @@ def run_day(
                 )
                 del positions[ticker]
 
-            if low <= setup.hold:
-                close(setup.hold, "STOP")
-            elif high >= setup.t1:
-                close(setup.t1, "T1")
+            if low <= pos["stop"]:
+                if t2_runner:
+                    reason = "T1" if pos["t2"] > pos["entry_price"] and pos["stop"] >= pos["entry_price"] else "STOP"
+                else:
+                    reason = "STOP"
+                close(pos["stop"], reason)
+            elif high >= pos["target"]:
+                if t2_runner and pos["t2"] > pos["target"]:
+                    pos["stop"] = pos["target"]
+                    pos["target"] = pos["t2"]
+                    if high >= pos["t2"]:
+                        close(pos["t2"], "T2")
+                else:
+                    if t2_runner:
+                        runner_t2 = (
+                            pos["t2"] > pos["entry_price"]
+                            and pos["target"] >= pos["t2"]
+                            and pos["stop"] >= pos["entry_price"]
+                        )
+                        reason = "T2" if runner_t2 else "T1"
+                    else:
+                        reason = "T1"
+                    close(pos["target"], reason)
 
     # EOD
     for ticker, pos in list(positions.items()):
@@ -566,6 +590,82 @@ def run_day(
 
 
 # ---------------------------------------------------------------------------
+# Vergelijking T1-only vs T2-runner
+# ---------------------------------------------------------------------------
+
+def _run_multi(
+    capital: float,
+    orb_minutes: int,
+    *,
+    t2_runner: bool,
+) -> tuple[float, List[TradeResult], list]:
+    dates = sorted(WATCHLISTS.keys())
+    cash = capital
+    all_trades: List[TradeResult] = []
+    day_results = []
+
+    for trade_date in dates:
+        watchlist = WATCHLISTS[trade_date]
+        tickers = list({s.ticker for s in watchlist})
+        data: Dict[str, Optional[pd.DataFrame]] = {}
+        for ticker in tickers:
+            data[ticker] = fetch_1m(ticker, trade_date)
+
+        day_capital = cash
+        end_cash, trades = run_day(
+            watchlist, data, day_capital,
+            orb_minutes=orb_minutes,
+            t2_runner=t2_runner,
+        )
+        day_pnl = end_cash - day_capital
+        all_trades.extend(trades)
+        cash = end_cash
+        wins = [t for t in trades if t.exit_reason in ("T1", "T2")]
+        stops = [t for t in trades if t.exit_reason == "STOP"]
+        t2s = [t for t in trades if t.exit_reason == "T2"]
+        day_results.append((trade_date, day_capital, end_cash, day_pnl, len(trades), len(wins), len(stops), len(t2s)))
+    return cash, all_trades, day_results
+
+
+def _run_compare(capital: float, orb_minutes: int) -> None:
+    dates = sorted(WATCHLISTS.keys())
+    print(f"\nMulti-day vergelijking | {dates[0]} -> {dates[-1]} | {len(dates)} dagen")
+    print(f"Startkapitaal: ${capital:.2f} | ORB: {orb_minutes}min | COMPOUND\n")
+
+    results = {}
+    for label, t2_runner in [("T1-only (oud)", False), ("T2-runner (nieuw)", True)]:
+        end_cash, trades, day_results = _run_multi(capital, orb_minutes, t2_runner=t2_runner)
+        wins = [t for t in trades if t.exit_reason in ("T1", "T2")]
+        t2s = [t for t in trades if t.exit_reason == "T2"]
+        stops = [t for t in trades if t.exit_reason == "STOP"]
+        ret = (end_cash - capital) / capital * 100
+        results[label] = {
+            "end_cash": end_cash,
+            "trades": len(trades),
+            "wins": len(wins),
+            "t2s": len(t2s),
+            "stops": len(stops),
+            "ret": ret,
+            "day_results": day_results,
+        }
+        print(f"--- {label} ---")
+        for row in day_results:
+            td, cap, end, pnl, n, w, s, t2 = row
+            print(f"  {td}  cap=${cap:>7.2f}  eind=${end:>7.2f}  pnl=${pnl:>+7.2f}  trades={n:>2}  [{w}W/{t2}T2/{s}S]")
+        print()
+
+    print(f"{'='*65}")
+    print(f"  {'Scenario':<22}  {'Eind':>8}  {'Return':>8}  {'Trades':>7}  {'T2':>4}  {'Stops':>6}")
+    print(f"  {'-'*60}")
+    for label, r in results.items():
+        print(
+            f"  {label:<22}  ${r['end_cash']:>7.2f}  {r['ret']:>+7.1f}%  "
+            f"{r['trades']:>7}  {r['t2s']:>4}  {r['stops']:>6}"
+        )
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -573,11 +673,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--capital", type=float, default=50.0)
     parser.add_argument("--orb", type=int, default=0, help="ORB minuten (0=geen, 15=scenario C)")
+    parser.add_argument("--no-t2-runner", action="store_true", help="Sluit bij T1 (geen runner naar T2)")
+    parser.add_argument("--compare-t2", action="store_true", help="Vergelijk T1-only vs T2-runner")
     args = parser.parse_args()
 
+    if args.compare_t2:
+        _run_compare(args.capital, args.orb)
+        return
+
     dates = sorted(WATCHLISTS.keys())
-    print(f"\nMulti-day backtest | {dates[0]} → {dates[-1]} | {len(dates)} handelsdagen")
-    print(f"Startkapitaal: ${args.capital:.2f} | Mode: COMPOUND | ORB: {args.orb}min\n")
+    mode = "T1-only" if args.no_t2_runner else "T2-runner"
+    print(f"\nMulti-day backtest | {dates[0]} -> {dates[-1]} | {len(dates)} handelsdagen")
+    print(f"Startkapitaal: ${args.capital:.2f} | Mode: COMPOUND | ORB: {args.orb}min | Exit: {mode}\n")
 
     capital        = args.capital
     total_pnl      = 0.0
@@ -594,7 +701,11 @@ def main() -> None:
             data[ticker] = fetch_1m(ticker, trade_date)
 
         day_capital = capital
-        end_cash, trades = run_day(watchlist, data, day_capital, orb_minutes=args.orb)
+        end_cash, trades = run_day(
+            watchlist, data, day_capital,
+            orb_minutes=args.orb,
+            t2_runner=not args.no_t2_runner,
+        )
 
         day_pnl = end_cash - day_capital
         total_pnl += day_pnl
@@ -602,7 +713,7 @@ def main() -> None:
 
         capital = end_cash
 
-        wins   = [t for t in trades if t.exit_reason == "T1"]
+        wins   = [t for t in trades if t.exit_reason in ("T1", "T2")]
         stops  = [t for t in trades if t.exit_reason == "STOP"]
         eods   = [t for t in trades if t.exit_reason == "EOD"]
         win_str = f"{len(wins)}W/{len(stops)}S/{len(eods)}EOD"
@@ -615,7 +726,7 @@ def main() -> None:
         )
 
     # Samenvattting
-    wins_all   = [t for t in all_trades if t.exit_reason == "T1"]
+    wins_all   = [t for t in all_trades if t.exit_reason in ("T1", "T2")]
     stops_all  = [t for t in all_trades if t.exit_reason == "STOP"]
     eods_all   = [t for t in all_trades if t.exit_reason == "EOD"]
     win_rate   = len(wins_all) / len(all_trades) * 100 if all_trades else 0

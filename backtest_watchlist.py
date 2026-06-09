@@ -78,6 +78,8 @@ def run_scenario(
     orb_minutes: int,
     capital: float,
     fee_pct: float = 0.0015,
+    *,
+    t2_runner: bool = True,
 ) -> list[TradeResult]:
     """
     Portfolio-simulator: één cash pool voor alle tickers.
@@ -167,6 +169,9 @@ def run_scenario(
                     "shares":      shares,
                     "spend":       spend,
                     "vol_mult":    vol_mult,
+                    "stop":        setup.hold,
+                    "target":      setup.t1,
+                    "t2":          setup.t2,
                 }
         else:
             pos = positions[ticker]
@@ -190,10 +195,27 @@ def run_scenario(
                 )
                 del positions[ticker]
 
-            if low <= setup.hold:
-                close_position(setup.hold, ts.strftime("%H:%M"), "STOP")
-            elif high >= setup.t1:
-                close_position(setup.t1, ts.strftime("%H:%M"), "T1")
+            if low <= pos["stop"]:
+                if t2_runner:
+                    reason = "T1" if pos["t2"] > pos["entry_price"] and pos["stop"] >= pos["entry_price"] else "STOP"
+                else:
+                    reason = "STOP"
+                close_position(pos["stop"], ts.strftime("%H:%M"), reason)
+            elif high >= pos["target"]:
+                if t2_runner and pos["t2"] > pos["target"]:
+                    pos["stop"] = pos["target"]
+                    pos["target"] = pos["t2"]
+                    if high >= pos["t2"]:
+                        close_position(pos["t2"], ts.strftime("%H:%M"), "T2")
+                else:
+                    runner_t2 = (
+                        t2_runner
+                        and pos["t2"] > pos["entry_price"]
+                        and pos["target"] >= pos["t2"]
+                        and pos["stop"] >= pos["entry_price"]
+                    )
+                    reason = "T2" if runner_t2 else "T1"
+                    close_position(pos["target"], ts.strftime("%H:%M"), reason)
 
     # EOD: sluit alle open posities
     for ticker, pos in list(positions.items()):
@@ -236,11 +258,11 @@ def run_scenario(
 # Rapportage
 # ---------------------------------------------------------------------------
 
-ICON = {"T1": "WIN ", "STOP": "STOP", "EOD": "EOD ", "NO_ENTRY": "----", "NO_DATA": "N/A ", "TOO_EXPENSIVE": "SKIP"}
+ICON = {"T1": "WIN ", "T2": "T2  ", "STOP": "STOP", "EOD": "EOD ", "NO_ENTRY": "----", "NO_DATA": "N/A ", "TOO_EXPENSIVE": "SKIP"}
 
 def print_scenario_report(results: list[TradeResult], scenario_label: str, capital: float) -> None:
     trades = [r for r in results if r.exit_reason not in ("NO_ENTRY", "NO_DATA", "TOO_EXPENSIVE")]
-    wins   = [r for r in trades if r.exit_reason == "T1"]
+    wins   = [r for r in trades if r.exit_reason in ("T1", "T2")]
     losses = [r for r in trades if r.exit_reason == "STOP"]
     total_pnl = sum(r.pnl for r in trades)
 
@@ -283,7 +305,7 @@ def print_comparison(all_results: dict[str, list[TradeResult]]) -> None:
     print(f"  {'-'*55}")
     for label, results in all_results.items():
         trades   = [r for r in results if r.exit_reason not in ("NO_ENTRY", "NO_DATA", "TOO_EXPENSIVE")]
-        wins     = [r for r in trades if r.exit_reason == "T1"]
+        wins     = [r for r in trades if r.exit_reason in ("T1", "T2")]
         no_entry = [r for r in results if r.exit_reason == "NO_ENTRY"]
         total_pnl = sum(r.pnl for r in trades)
         win_pct = f"{len(wins)/len(trades)*100:.0f}%" if trades else "n/a"

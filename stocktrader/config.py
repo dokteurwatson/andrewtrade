@@ -121,7 +121,7 @@ class Settings:
             t212_api_key=_str("T212_API_KEY", ""),
             t212_api_secret=_str("T212_API_SECRET", ""),
             t212_demo=_bool("T212_DEMO", True),
-            t212_extended_hours=_bool("T212_EXTENDED_HOURS", True),
+            t212_extended_hours=_bool("T212_EXTENDED_HOURS", False),
             fx_eur_usd=_float("FX_EUR_USD", 1.08),
             fx_gbp_usd=_float("FX_GBP_USD", 1.27),
             fx_buffer_pct=_float("FX_BUFFER_PCT", 0.03),

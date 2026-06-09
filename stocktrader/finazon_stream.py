@@ -266,6 +266,7 @@ class FinazonBarStream:
                 ticker, float(msg.get("c", 0)), float(msg.get("v", 0)),
             )
         try:
+            bar_ts = int(msg["t"]) if "t" in msg else None
             handler(
                 ticker,
                 float(msg["o"]),
@@ -274,6 +275,7 @@ class FinazonBarStream:
                 float(msg["c"]),
                 float(msg["v"]),
                 True,
+                bar_ts=bar_ts,
             )
         except Exception as exc:
             logging.warning("FinazonBarStream emit_bar %s: %s", ticker, exc)

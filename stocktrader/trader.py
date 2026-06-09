@@ -26,7 +26,7 @@ import zoneinfo
 
 from .bar_stream import build_bar_stream
 from .config import Settings
-from .market_data import ET, orb_avg_volume
+from .market_data import ET, in_regular_session, orb_avg_volume
 from .market_snapshot import build_quote_row, quote_status
 from .notifier import Notifier
 from .parser import Setup
@@ -105,6 +105,7 @@ class Trader:
             settings.telegram_chat_id,
         )
         self.store = StateStore(settings.state_dir)
+        # Lock: alleen korte in-memory state; nooit tijdens broker-/netwerk-I/O.
         self._lock = threading.Lock()
 
         self._orb_volumes: Dict[str, List[float]] = defaultdict(list)
@@ -119,6 +120,7 @@ class Trader:
         self._order_queue: queue.Queue = queue.Queue()
         self._order_worker_thread: Optional[threading.Thread] = None
         self._last_bar: Dict[str, float] = {}
+        self._last_bar_ts: Dict[str, int] = {}
         self._quote_snapshots: Dict[str, dict] = {}
         self._data_blocked: Set[str] = set()
         self._broker_blocked: Set[str] = set()
@@ -129,6 +131,12 @@ class Trader:
         self._last_heartbeat_log: float = 0.0
         self._bars_received: int = 0
         self._no_bars_market_warned: bool = False
+        self._pending_entries: Set[str] = set()
+        self._extended_hours_notified: bool = False
+
+    def _release_entry(self, ticker: str) -> None:
+        with self._lock:
+            self._pending_entries.discard(ticker.upper())
 
     def load_day(self, state: DayState) -> None:
         with self._lock:
@@ -143,6 +151,17 @@ class Trader:
     def _on_stream_excluded(self, ticker: str) -> None:
         with self._lock:
             self._stream_excluded.add(ticker.upper())
+
+    def _can_place_entry(self) -> bool:
+        """Entries alleen in reguliere sessie, tenzij T212 extended hours actief is."""
+        if in_regular_session(datetime.now(ET)):
+            return True
+        if self.settings.effective_broker() != "t212":
+            return True
+        from .t212_client import T212Client
+        if isinstance(self.client, T212Client) and self.client.extended_hours_enabled():
+            return True
+        return False
 
     def _block_broker_ticker(self, ticker: str, reason: str) -> None:
         key = ticker.upper()
@@ -293,10 +312,12 @@ class Trader:
                     continue
                 state = self._state
                 kind = action[0]
-                if kind == "ENTER":
-                    self._enter(state, action[1])  # type: ignore[arg-type]
-                elif kind == "EXIT":
-                    self._exit(state, action[1], action[2], action[3])  # type: ignore[arg-type]
+                args = action[1:]
+            # Geen lock tijdens broker-I/O (T212 kan seconden duren).
+            if kind == "ENTER":
+                self._enter(state, args[0])  # type: ignore[arg-type]
+            elif kind == "EXIT":
+                self._exit(state, args[0], args[1], args[2])  # type: ignore[arg-type]
 
     def _run_loop_inner(self) -> None:
         setups = self._state.get_setups() if self._state else []
@@ -379,8 +400,10 @@ class Trader:
         self._bar_count.clear()
         with self._lock:
             self._last_bar = {}
+            self._last_bar_ts = {}
             self._quote_snapshots = {}
             self._data_blocked = set()
+            self._pending_entries.clear()
         self._engine_started_at = time.monotonic()
         self._last_bar_health_log = self._engine_started_at
         self._last_heartbeat_log = self._engine_started_at
@@ -419,7 +442,10 @@ class Trader:
                 now_mono = time.monotonic()
                 uptime = now_mono - self._engine_started_at
 
-                if now_mono - self._last_bar_health_log >= _BAR_HEALTH_INTERVAL_SEC:
+                if (
+                    in_regular_session(now)
+                    and now_mono - self._last_bar_health_log >= _BAR_HEALTH_INTERVAL_SEC
+                ):
                     self._log_bar_health(tickers, stale_sec, data_src)
                     self._last_bar_health_log = now_mono
 
@@ -433,12 +459,9 @@ class Trader:
                     )
                     self._last_heartbeat_log = now_mono
 
-                in_regular_session = (
-                    (now.hour > MARKET_OPEN_H or (now.hour == MARKET_OPEN_H and now.minute >= MARKET_OPEN_M))
-                    and (now.hour < MARKET_CLOSE_H or (now.hour == MARKET_CLOSE_H and now.minute < MARKET_CLOSE_M))
-                )
+                session_open = in_regular_session(now)
                 if (
-                    in_regular_session
+                    session_open
                     and uptime >= _STALE_GRACE_SEC
                     and not self._no_bars_market_warned
                 ):
@@ -453,7 +476,7 @@ class Trader:
                         logging.warning(msg)
                         self.notifier.send(msg)
 
-                if uptime >= _STALE_GRACE_SEC:
+                if session_open and uptime >= _STALE_GRACE_SEC:
                     with self._lock:
                         last_bar_snapshot = dict(self._last_bar)
                         data_blocked_snapshot = set(self._data_blocked)
@@ -481,7 +504,6 @@ class Trader:
                                     self._data_blocked.discard(tkr)
                                 logging.info("Data hersteld voor %s — blokkade opgeheven.", tkr)
 
-                        # Blokkeer handel als data te lang oud is
                         if age > block_sec and tkr not in data_blocked_snapshot:
                             with self._lock:
                                 self._data_blocked.add(tkr)
@@ -497,6 +519,8 @@ class Trader:
                             f"(data={data_src})."
                         )
                         _stale_warned.clear()
+                elif not session_open and uptime >= _STALE_GRACE_SEC:
+                    _stale_warned.clear()
 
             time.sleep(15)
 
@@ -533,14 +557,27 @@ class Trader:
         close: float,
         volume: float,
         is_new_bar: bool = True,
+        bar_ts: Optional[int] = None,
     ) -> None:
         if not self._running:
             return
+
+        if is_new_bar and bar_ts is not None:
+            with self._lock:
+                last_ts = self._last_bar_ts.get(ticker)
+            if last_ts is not None and bar_ts <= last_ts:
+                logging.debug(
+                    "BAR %s ts=%d overgeslagen (duplicaat)",
+                    ticker, bar_ts,
+                )
+                return
 
         if is_new_bar:
             with self._lock:
                 self._bars_received += 1
                 self._last_bar[ticker] = time.monotonic()
+                if bar_ts is not None:
+                    self._last_bar_ts[ticker] = bar_ts
                 if ticker in self._data_blocked:
                     self._data_blocked.discard(ticker)
                     logging.info("Data hersteld voor %s via binnenkomende bar.", ticker)
@@ -627,14 +664,44 @@ class Trader:
             if ticker in positions:
                 pos = positions[ticker]
                 if low <= pos.stop_price:
-                    logging.info("STOP %s | low=%.4f", ticker, low)
-                    self._order_queue.put(("EXIT", pos, pos.stop_price, "STOP"))
+                    reason = (
+                        "T1"
+                        if pos.t2_price > pos.entry_price and pos.stop_price >= pos.entry_price
+                        else "STOP"
+                    )
+                    logging.info("%s %s | low=%.4f stop=%.4f", reason, ticker, low, pos.stop_price)
+                    self._order_queue.put(("EXIT", pos, pos.stop_price, reason))
                 elif (
                     pos.target_price > pos.entry_price
                     and high >= pos.target_price
                 ):
-                    logging.info("T1 %s | high=%.4f", ticker, high)
-                    self._order_queue.put(("EXIT", pos, pos.target_price, "T1"))
+                    if pos.t2_price > pos.target_price:
+                        t1_floor = pos.target_price
+                        t2_target = pos.t2_price
+                        pos_dict = state.positions[ticker]
+                        pos_dict["stop_price"] = t1_floor
+                        pos_dict["target_price"] = t2_target
+                        self.store.save(state)
+                        logging.info(
+                            "T1 GERAAKT %s — stop → %.4f, target → %.4f (T2)",
+                            ticker, t1_floor, t2_target,
+                        )
+                        self.notifier.send(
+                            f"T1 {ticker} geraakt — runner actief | stop ${t1_floor:.2f} | T2 ${t2_target:.2f}"
+                        )
+                        if high >= t2_target:
+                            logging.info("T2 %s | high=%.4f (zelfde bar)", ticker, high)
+                            pos = state.get_positions()[ticker]
+                            self._order_queue.put(("EXIT", pos, t2_target, "T2"))
+                    else:
+                        runner_t2 = (
+                            pos.t2_price > pos.entry_price
+                            and pos.target_price >= pos.t2_price
+                            and pos.stop_price >= pos.entry_price
+                        )
+                        reason = "T2" if runner_t2 else "T1"
+                        logging.info("%s %s | high=%.4f", reason, ticker, high)
+                        self._order_queue.put(("EXIT", pos, pos.target_price, reason))
                 return
 
             closed_today = {t.ticker for t in state.get_closed_trades()}
@@ -654,12 +721,20 @@ class Trader:
                         "BREAKOUT %s overgeslagen — high=%.4f al >= T1=%.4f",
                         ticker, high, setup.t1,
                     )
+                elif ticker in self._pending_entries:
+                    logging.info("BREAKOUT %s overgeslagen — entry bezig.", ticker)
+                elif not self._can_place_entry():
+                    logging.info(
+                        "BREAKOUT %s overgeslagen — buiten reguliere sessie (09:30–15:55 ET).",
+                        ticker,
+                    )
                 elif vol_ok:
                     orb_info = f" | orb_high={orb_high:.4f}" if orb_high else ""
                     logging.info(
                         "BREAKOUT %s | high=%.4f >= break=%.4f | vol=%.0f%s",
                         ticker, high, setup.break_, volume, orb_info,
                     )
+                    self._pending_entries.add(ticker)
                     self._order_queue.put(("ENTER", setup))
                 else:
                     logging.info(
@@ -696,8 +771,8 @@ class Trader:
         if not isinstance(self.client, T212Client):
             return
         suffix = f" ({label})" if label else ""
-        # Account summary: T212 rate limit 1 req / 5s — wacht en retry na orders.
-        for attempt in range(3):
+        # Account summary: T212 rate limit 1 req / 5s — één retry, buiten trader-lock.
+        for attempt in range(2):
             try:
                 if attempt > 0:
                     time.sleep(5.5)
@@ -708,11 +783,11 @@ class Trader:
                     logging.info("Cash bijgewerkt%s: %.2f %s", suffix, cash, ccy)
                 return
             except T212RateLimitError as exc:
-                if attempt < 2:
+                if attempt == 0:
                     wait = exc.retry_after or 5.5
                     logging.info(
-                        "Cash sync rate limit%s — retry over %.1fs (poging %d/3)",
-                        suffix, wait, attempt + 1,
+                        "Cash sync rate limit%s — retry over %.1fs",
+                        suffix, wait,
                     )
                     time.sleep(wait)
                     continue
@@ -764,12 +839,14 @@ class Trader:
             target_price=target_price,
             entry_time=datetime.now(ET).strftime("%H:%M"),
             order_id=order_id,
+            t2_price=setup.t2,
         )
         self.store.open_position(state, pos)
         max_loss = (entry_price - setup.hold) * shares
+        t2_note = f" | T2: ${setup.t2:.2f}" if setup.t2 > target_price else ""
         msg = (
             f"{label} {setup.ticker} | {shares}x @ ${entry_price:.2f} | "
-            f"Stop: ${setup.hold:.2f} | T1: ${target_price:.2f} | "
+            f"Stop: ${setup.hold:.2f} | T1: ${target_price:.2f}{t2_note} | "
             f"Max verlies: ${max_loss:.2f}"
         )
         logging.info(msg)
@@ -777,6 +854,26 @@ class Trader:
             self.notifier.send(msg)
 
     def _enter(self, state: DayState, setup: Setup) -> None:
+        key = setup.ticker.upper()
+        try:
+            with self._lock:
+                if key in state.get_positions():
+                    logging.info(
+                        "ENTRY %s overgeslagen — positie al open.",
+                        setup.ticker,
+                    )
+                    return
+                if key not in self._pending_entries:
+                    logging.warning(
+                        "ENTRY %s overgeslagen — geen pending-reservering.",
+                        setup.ticker,
+                    )
+                    return
+            self._enter_inner(state, setup)
+        finally:
+            self._release_entry(setup.ticker)
+
+    def _enter_inner(self, state: DayState, setup: Setup) -> None:
         s = self.settings
 
         if len(state.positions) >= s.max_positions:
@@ -845,7 +942,7 @@ class Trader:
         try:
             order_id = self.client.buy_market(setup.ticker, shares)
         except Exception as exc:
-            from .t212_client import T212CloseOnlyError
+            from .t212_client import T212CloseOnlyError, T212Client, T212ExtendedHoursNotAllowedError
 
             if isinstance(exc, T212CloseOnlyError):
                 self._block_broker_ticker(
@@ -853,6 +950,20 @@ class Trader:
                 )
                 self.notifier.send(
                     f"{setup.ticker}: close-only op T212 — geen nieuwe buys vandaag"
+                )
+                return
+            if isinstance(exc, T212ExtendedHoursNotAllowedError):
+                if isinstance(self.client, T212Client):
+                    self.client.disable_extended_hours()
+                if not self._extended_hours_notified:
+                    self._extended_hours_notified = True
+                    self.notifier.send(
+                        "T212: extended hours niet toegestaan op dit account — "
+                        "orders alleen 09:30–15:55 ET"
+                    )
+                logging.warning(
+                    "Order %s overgeslagen — extended hours niet toegestaan op T212-account.",
+                    setup.ticker,
                 )
                 return
             detail = str(exc).strip() or repr(exc)

@@ -2,11 +2,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: stocktrader-dashboard
-  namespace: stocktrader-live
+  namespace: stocktrader
   labels:
     app: stocktrader
     component: dashboard
 spec:
+  revisionHistoryLimit: 2
   replicas: 1
   selector:
     matchLabels:
@@ -20,9 +21,11 @@ spec:
         app: stocktrader
         component: dashboard
     spec:
+      imagePullSecrets:
+        - name: registry-dizzyman-nl
       containers:
         - name: dashboard
-          image: registry.dizzyman.nl/stocktrader:1.1.7
+          image: registry.dizzyman.nl/stocktrader:1.3.14
           imagePullPolicy: Always
           command: ["python", "-m", "stocktrader.dashboard"]
           ports:
@@ -30,7 +33,9 @@ spec:
               name: http
           envFrom:
             - secretRef:
-                name: stocktrader-env
+                name: stocktrader-config
+            - secretRef:
+                name: stocktrader-credentials
           volumeMounts:
             - name: state
               mountPath: /data

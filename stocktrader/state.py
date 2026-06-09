@@ -30,13 +30,14 @@ from .parser import Setup
 
 @dataclass
 class Position:
-    ticker:      str
-    shares:      int
-    entry_price: float
-    stop_price:  float
+    ticker:       str
+    shares:       int
+    entry_price:  float
+    stop_price:   float
     target_price: float
-    entry_time:  str
-    order_id:    str
+    entry_time:   str
+    order_id:     str
+    t2_price:     float = 0.0
 
 
 @dataclass
@@ -47,7 +48,7 @@ class ClosedTrade:
     exit_price:  float
     entry_time:  str
     exit_time:   str
-    reason:      str   # "T1", "STOP", "EOD", "MANUAL"
+    reason:      str   # "T1", "T2", "STOP", "EOD", "MANUAL"
     pnl:         float
 
 
@@ -87,7 +88,7 @@ class DayState:
 
     def get_positions(self) -> Dict[str, Position]:
         return {
-            ticker: Position(**pos)
+            ticker: Position(**{**pos, "t2_price": pos.get("t2_price", 0.0)})
             for ticker, pos in self.positions.items()
         }
 

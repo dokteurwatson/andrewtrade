@@ -184,7 +184,7 @@ def test_on_message_invalid_json_ignored():
 def test_on_message_bar_triggers_handler():
     s = _make_stream()
     received = []
-    s._callbacks["AAPL"] = lambda *args: received.append(args)
+    s._callbacks["AAPL"] = lambda *args, **kwargs: received.append((args, kwargs))
     ws = MagicMock()
     raw = json.dumps({
         "d": "us_stocks_essential",
@@ -202,8 +202,10 @@ def test_on_message_bar_triggers_handler():
     })
     s._on_message(ws, raw)
     assert len(received) == 1
-    ticker, o, h, l, c, v, is_new = received[0]
+    args, kwargs = received[0]
+    ticker, o, h, l, c, v, is_new = args
     assert ticker == "AAPL"
+    assert kwargs["bar_ts"] == 1699540020
     assert o == pytest.approx(220.06)
     assert h == pytest.approx(220.13)
     assert l == pytest.approx(219.92)

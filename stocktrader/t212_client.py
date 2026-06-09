@@ -84,6 +84,10 @@ class T212CloseOnlyError(T212Error):
     """Instrument staat in close-only mode — geen nieuwe buys."""
 
 
+class T212ExtendedHoursNotAllowedError(T212Error):
+    """Account ondersteunt geen extended-hours orders."""
+
+
 def _is_position_gone_message(msg: str) -> bool:
     lower = msg.lower()
     return any(
@@ -292,6 +296,14 @@ class T212Client:
     # Orders
     # ------------------------------------------------------------------
 
+    def extended_hours_enabled(self) -> bool:
+        return self._extended_hours
+
+    def disable_extended_hours(self) -> None:
+        if self._extended_hours:
+            logging.info("T212 extended hours uitgeschakeld (account ondersteunt het niet).")
+        self._extended_hours = False
+
     def _market_payload(self, t212_ticker: str, quantity: float) -> dict:
         """T212 MarketRequest: alleen ticker, quantity (+ optioneel extendedHours)."""
         payload: dict = {"ticker": t212_ticker, "quantity": quantity}
@@ -416,6 +428,8 @@ class T212Client:
         lower = body.lower()
         if "close-only-mode" in lower or "close only mode" in lower:
             return T212CloseOnlyError(msg)
+        if "extended-hours-trading-not-allowed" in lower:
+            return T212ExtendedHoursNotAllowedError(msg)
         return T212Error(msg)
 
     def _request_with_retry(self, method: str, path: str, payload: Optional[dict] = None) -> any:
