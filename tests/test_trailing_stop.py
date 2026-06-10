@@ -187,4 +187,4 @@ def test_trailing_exit_on_pullback(mock_broker, mock_stream) -> None:
     trader._on_bar("STAK", 4.15, 4.18, trail_stop - 0.05, 4.0, 1000, is_new_bar=True)
     action = trader._order_queue.get_nowait()
     assert action[0] == "EXIT"
-    assert action[3] == "T1"  # stop >= entry na trailing
+    assert action[3] == "TRAIL"  # trailing stop boven entry, maar geen runner

@@ -708,11 +708,12 @@ class Trader:
                 self._apply_trailing_stop(state, ticker, pos_dict, high)
                 pos = state.get_positions()[ticker]
                 if low <= pos.stop_price:
-                    reason = (
-                        "T1"
-                        if pos.t2_price > pos.entry_price and pos.stop_price >= pos.entry_price
-                        else "STOP"
-                    )
+                    if pos_dict.get("runner_active"):
+                        reason = "T1"   # stop staat op T1-vloer na runner-promotie
+                    elif pos.stop_price >= pos.entry_price - 1e-9:
+                        reason = "TRAIL"  # trailing stop heeft stop boven entry getrokken
+                    else:
+                        reason = "STOP"   # originele hold geraakt
                     logging.info("%s %s | low=%.4f stop=%.4f", reason, ticker, low, pos.stop_price)
                     self._order_queue.put(("EXIT", pos, pos.stop_price, reason))
                 elif (

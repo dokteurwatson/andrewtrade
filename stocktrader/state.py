@@ -50,7 +50,7 @@ class ClosedTrade:
     exit_price:  float
     entry_time:  str
     exit_time:   str
-    reason:      str   # "T1", "T2", "STOP", "EOD", "MANUAL"
+    reason:      str   # "T1", "T2", "STOP", "TRAIL", "EOD", "MANUAL"
     pnl:         float
 
 

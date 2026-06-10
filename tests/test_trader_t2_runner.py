@@ -133,6 +133,7 @@ def test_runner_floor_exit_at_t1(mock_broker, mock_stream) -> None:
     mock_broker.return_value = MagicMock()
     mock_stream.return_value = MagicMock()
     trader = _trader_with_position(stop=4.50, target=5.00)
+    trader._state.positions["STAK"]["runner_active"] = True
 
     trader._on_bar("STAK", 4.6, 4.7, 4.49, 4.5, 1000, is_new_bar=True)
 

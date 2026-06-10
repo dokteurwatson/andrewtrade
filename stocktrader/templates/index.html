@@ -36,9 +36,10 @@
     .x-icon { color: #ff4444; font-weight: bold; margin-right: 4px; }
     .last-ref { color: #888; font-size: 0.7rem; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; font-weight: bold; }
-    .badge-win  { background: #004422; color: #00ff88; }
-    .badge-stop { background: #440000; color: #ff4444; }
-    .badge-eod  { background: #222; color: #aaa; }
+    .badge-win   { background: #004422; color: #00ff88; }
+    .badge-stop  { background: #440000; color: #ff4444; }
+    .badge-trail { background: #003344; color: #44ccff; }
+    .badge-eod   { background: #222; color: #aaa; }
     .badge-excluded { background: #440000; color: #ff8888; }
     .badge-wait { background: #332200; color: #ffcc00; }
     .error { background: #440000; color: #ff8888; padding: 10px 14px; border-radius: 4px; margin-bottom: 16px; font-size: 0.85rem; }
@@ -322,7 +323,17 @@
         <td><strong>{{ t.ticker }}</strong></td>
         <td>{{ t.shares }}x</td>
         <td class="{% if t.pnl >= 0 %}green{% else %}red{% endif %}">{{ account_currency_symbol }}{{ "%+.2f"|format(t.pnl) }}</td>
-        <td>{{ t.reason }}</td>
+        <td>
+          {% if t.reason == 'T1' or t.reason == 'T2' %}
+            <span class="badge badge-win">{{ t.reason }}</span>
+          {% elif t.reason == 'TRAIL' %}
+            <span class="badge badge-trail">TRAIL</span>
+          {% elif t.reason == 'STOP' %}
+            <span class="badge badge-stop">STOP</span>
+          {% else %}
+            <span class="badge badge-eod">{{ t.reason }}</span>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </table>
