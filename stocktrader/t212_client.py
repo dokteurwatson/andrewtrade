@@ -341,32 +341,6 @@ class T212Client:
         )
         return order_id
 
-    def sell_limit(self, ticker: str, shares: int, limit_price: float) -> str:
-        """
-        Limit sell-order: vult alleen als marktprijs >= limit_price.
-        Voorkomt slippage onder de stop-prijs bij volatile stocks.
-        """
-        t212 = self._map_ticker(ticker)
-        payload = {
-            "ticker": t212,
-            "quantity": -abs(shares),
-            "limitPrice": round(limit_price, 4),
-            "timeValidity": "DAY",
-        }
-        try:
-            response = self._post("/equity/orders/limit", payload)
-        except T212Error as exc:
-            if _is_position_gone_message(str(exc)):
-                raise T212PositionNotFoundError(str(exc)) from exc
-            raise
-        order_id = str(response.get("id", f"t212-sell-lim-{ticker}-{int(time.time())}"))
-        self.invalidate_account_cache()
-        logging.info(
-            "T212 SELL LIMIT %s x%d @ %.4f [%s] → order_id=%s",
-            ticker, shares, limit_price, self._mode, order_id,
-        )
-        return order_id
-
     def get_order_fill_price(
         self, order_id: str, *, timeout: float = 6.0, poll_interval: float = 0.5
     ) -> Optional[float]:

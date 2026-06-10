@@ -45,7 +45,7 @@ _BAR_HEALTH_INTERVAL_SEC = 120
 _STALE_GRACE_MIN_SEC = 180  # eerste stale-waarschuwing (niet 10 min wachten)
 
 # Order queue item types
-_OrderAction = Tuple[str, ...]  # ("ENTER", setup) | ("EXIT", pos, exit_price, reason, is_stop)
+_OrderAction = Tuple[str, ...]  # ("ENTER", setup) | ("EXIT", pos, exit_price, reason)
 
 
 def _build_broker_client(settings: Settings):
@@ -324,8 +324,7 @@ class Trader:
             if kind == "ENTER":
                 self._enter(state, args[0])  # type: ignore[arg-type]
             elif kind == "EXIT":
-                is_stop = bool(args[3]) if len(args) > 3 else False
-                self._exit(state, args[0], args[1], args[2], is_stop_exit=is_stop)  # type: ignore[arg-type]
+                self._exit(state, args[0], args[1], args[2])  # type: ignore[arg-type]
 
     def _run_loop_inner(self) -> None:
         setups = self._state.get_setups() if self._state else []
@@ -564,16 +563,13 @@ class Trader:
         ticker: str,
         pos_dict: dict,
         high: float,
-        close: float = 0.0,
     ) -> None:
         if not trailing_allowed(pos_dict):
             return
         if high >= float(pos_dict["target_price"]) - 1e-9:
             return
         entry = float(pos_dict["entry_price"])
-        # TRAIL_USE_CLOSE=true: HWM op close (negeert intrabar wicks)
-        hw_price = close if (self.settings.trail_use_close and close > 0) else high
-        hw = max(float(pos_dict.get("high_water") or entry), hw_price)
+        hw = max(float(pos_dict.get("high_water") or entry), high)
 
         new_hw, new_stop, changed = compute_trailing_stop(
             entry=entry,
@@ -709,7 +705,7 @@ class Trader:
 
             if ticker in positions:
                 pos_dict = state.positions[ticker]
-                self._apply_trailing_stop(state, ticker, pos_dict, high, close=close)
+                self._apply_trailing_stop(state, ticker, pos_dict, high)
                 pos = state.get_positions()[ticker]
                 if low <= pos.stop_price:
                     if pos_dict.get("runner_active"):
@@ -719,7 +715,7 @@ class Trader:
                     else:
                         reason = "STOP"   # originele hold geraakt
                     logging.info("%s %s | low=%.4f stop=%.4f", reason, ticker, low, pos.stop_price)
-                    self._order_queue.put(("EXIT", pos, pos.stop_price, reason, True))
+                    self._order_queue.put(("EXIT", pos, pos.stop_price, reason))
                 elif (
                     pos.target_price > pos.entry_price
                     and high >= pos.target_price
@@ -742,7 +738,7 @@ class Trader:
                         if high >= t2_target:
                             logging.info("T2 %s | high=%.4f (zelfde bar)", ticker, high)
                             pos = state.get_positions()[ticker]
-                            self._order_queue.put(("EXIT", pos, t2_target, "T2", False))
+                            self._order_queue.put(("EXIT", pos, t2_target, "T2"))
                     else:
                         runner_t2 = (
                             pos.t2_price > pos.entry_price
@@ -751,7 +747,7 @@ class Trader:
                         )
                         reason = "T2" if runner_t2 else "T1"
                         logging.info("%s %s | high=%.4f", reason, ticker, high)
-                        self._order_queue.put(("EXIT", pos, pos.target_price, reason, False))
+                        self._order_queue.put(("EXIT", pos, pos.target_price, reason))
                 return
 
             if not is_new_bar:
@@ -1052,22 +1048,9 @@ class Trader:
         )
         self._sync_cash_from_broker(state, "buy")
 
-    def _do_sell(self, pos: Position, limit_price: Optional[float] = None) -> Optional[float]:
-        """
-        Voer sell-order uit en geef werkelijke fill-prijs terug (of None als onbekend).
-
-        Als limit_price opgegeven is én STOP_SELL_LIMIT=true, wordt een limit-sell
-        geplaatst op limit_price (vult alleen als marktprijs >= limit_price).
-        """
-        use_limit = (
-            limit_price is not None
-            and self.settings.stop_sell_limit
-            and hasattr(self.client, "sell_limit")
-        )
-        if use_limit:
-            order_id = self.client.sell_limit(pos.ticker, pos.shares, limit_price)
-        else:
-            order_id = self.client.sell_market(pos.ticker, pos.shares)
+    def _do_sell(self, pos: Position) -> Optional[float]:
+        """Voer sell-order uit en geef werkelijke fill-prijs terug (of None als onbekend)."""
+        order_id = self.client.sell_market(pos.ticker, pos.shares)
         if hasattr(self.client, "get_order_fill_price"):
             return self.client.get_order_fill_price(order_id)
         return None
@@ -1104,18 +1087,9 @@ class Trader:
         logging.info(msg)
         self.notifier.send(msg)
 
-    def _exit(
-        self,
-        state: DayState,
-        pos: Position,
-        exit_price: float,
-        reason: str,
-        is_stop_exit: bool = False,
-    ) -> None:
-        # Bij stop/trail exits: geef stop_price mee zodat _do_sell een limit-sell kan plaatsen
-        limit_hint = pos.stop_price if is_stop_exit else None
+    def _exit(self, state: DayState, pos: Position, exit_price: float, reason: str) -> None:
         try:
-            fill_price = self._do_sell(pos, limit_price=limit_hint)
+            fill_price = self._do_sell(pos)
         except Exception as exc:
             if _is_position_gone_error(exc):
                 logging.warning(

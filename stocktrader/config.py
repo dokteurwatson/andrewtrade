@@ -50,8 +50,7 @@ class Settings:
     fx_eur_usd: float          # fallback EUR→USD als live FX faalt
     fx_gbp_usd: float          # fallback GBP→USD als live FX faalt
     fx_buffer_pct: float       # marge op FX-schatting (T212 spread/fees)
-    t212_fx_fee_pct:    float  # T212 FX-conversiekosten per transactie (koop + verkoop)
-    stop_sell_limit:    bool   # gebruik limit-sell ipv market-sell bij stop/trail exits (voorkomt slippage)
+    t212_fx_fee_pct: float     # T212 FX-conversiekosten per transactie (koop + verkoop)
 
     max_order_usd:    float
     max_shares_per_order: int
@@ -64,7 +63,6 @@ class Settings:
     trail_activation_pct:  float
     trail_distance_pct:    float
     trail_steps:           str    # bijv. "5:0,10:5,15:10"
-    trail_use_close:       bool   # HWM op bar-close ipv intrabar high (minder gevoelig voor wicks)
 
     cash_reserve_pct:        float
     risk_threshold_usd:      float
@@ -137,7 +135,6 @@ class Settings:
             fx_gbp_usd=_float("FX_GBP_USD", 1.27),
             fx_buffer_pct=_float("FX_BUFFER_PCT", 0.03),
             t212_fx_fee_pct=_float("T212_FX_FEE_PCT", 0.11),
-            stop_sell_limit=_bool("STOP_SELL_LIMIT", False),
             max_order_usd=_float("MAX_ORDER_USD", 500.0),
             max_shares_per_order=_int("MAX_SHARES_PER_ORDER", 0),
             volume_mult=_float("VOLUME_MULT", 2.0),
@@ -147,7 +144,6 @@ class Settings:
             trail_activation_pct=_float("TRAIL_ACTIVATION_PCT", 5.0),
             trail_distance_pct=_float("TRAIL_DISTANCE_PCT", 3.0),
             trail_steps=_str("TRAIL_STEPS", "5:0,10:5,15:10"),
-            trail_use_close=_bool("TRAIL_USE_CLOSE", False),
             cash_reserve_pct=_float("CASH_RESERVE_PCT", 0.02),
             risk_threshold_usd=_float("RISK_THRESHOLD_USD", 200.0),
             risk_per_trade_pct=_float("RISK_PER_TRADE_PCT", 0.02),
