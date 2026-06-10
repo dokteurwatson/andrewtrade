@@ -63,6 +63,7 @@ class Settings:
     trail_activation_pct:  float
     trail_distance_pct:    float
     trail_steps:           str    # bijv. "5:0,10:5,15:10"
+    trail_use_close:       bool   # HWM op bar-close ipv intrabar high (minder gevoelig voor wicks)
 
     cash_reserve_pct:        float
     risk_threshold_usd:      float
@@ -144,6 +145,7 @@ class Settings:
             trail_activation_pct=_float("TRAIL_ACTIVATION_PCT", 5.0),
             trail_distance_pct=_float("TRAIL_DISTANCE_PCT", 3.0),
             trail_steps=_str("TRAIL_STEPS", "5:0,10:5,15:10"),
+            trail_use_close=_bool("TRAIL_USE_CLOSE", False),
             cash_reserve_pct=_float("CASH_RESERVE_PCT", 0.02),
             risk_threshold_usd=_float("RISK_THRESHOLD_USD", 200.0),
             risk_per_trade_pct=_float("RISK_PER_TRADE_PCT", 0.02),

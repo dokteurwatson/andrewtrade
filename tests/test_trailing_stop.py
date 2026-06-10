@@ -45,6 +45,7 @@ def _settings(**kwargs) -> Settings:
         trail_activation_pct=5.0,
         trail_distance_pct=3.0,
         trail_steps="5:0,10:5,15:10",
+        trail_use_close=False,
         cash_reserve_pct=0.02,
         risk_threshold_usd=200.0,
         risk_per_trade_pct=0.02,

@@ -563,13 +563,16 @@ class Trader:
         ticker: str,
         pos_dict: dict,
         high: float,
+        close: float = 0.0,
     ) -> None:
         if not trailing_allowed(pos_dict):
             return
         if high >= float(pos_dict["target_price"]) - 1e-9:
             return
         entry = float(pos_dict["entry_price"])
-        hw = max(float(pos_dict.get("high_water") or entry), high)
+        # TRAIL_USE_CLOSE=true: HWM op close (negeert intrabar wicks)
+        hw_price = close if (self.settings.trail_use_close and close > 0) else high
+        hw = max(float(pos_dict.get("high_water") or entry), hw_price)
 
         new_hw, new_stop, changed = compute_trailing_stop(
             entry=entry,
@@ -705,7 +708,7 @@ class Trader:
 
             if ticker in positions:
                 pos_dict = state.positions[ticker]
-                self._apply_trailing_stop(state, ticker, pos_dict, high)
+                self._apply_trailing_stop(state, ticker, pos_dict, high, close=close)
                 pos = state.get_positions()[ticker]
                 if low <= pos.stop_price:
                     if pos_dict.get("runner_active"):
