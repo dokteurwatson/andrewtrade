@@ -50,6 +50,7 @@ class Settings:
     fx_eur_usd: float          # fallback EUR→USD als live FX faalt
     fx_gbp_usd: float          # fallback GBP→USD als live FX faalt
     fx_buffer_pct: float       # marge op FX-schatting (T212 spread/fees)
+    t212_fx_fee_pct: float     # T212 FX-conversiekosten per transactie (koop + verkoop)
 
     max_order_usd:    float
     max_shares_per_order: int
@@ -133,6 +134,7 @@ class Settings:
             fx_eur_usd=_float("FX_EUR_USD", 1.08),
             fx_gbp_usd=_float("FX_GBP_USD", 1.27),
             fx_buffer_pct=_float("FX_BUFFER_PCT", 0.03),
+            t212_fx_fee_pct=_float("T212_FX_FEE_PCT", 0.11),
             max_order_usd=_float("MAX_ORDER_USD", 500.0),
             max_shares_per_order=_int("MAX_SHARES_PER_ORDER", 0),
             volume_mult=_float("VOLUME_MULT", 2.0),

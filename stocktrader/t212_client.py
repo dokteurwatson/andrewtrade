@@ -341,6 +341,48 @@ class T212Client:
         )
         return order_id
 
+    def get_order_fill_price(
+        self, order_id: str, *, timeout: float = 6.0, poll_interval: float = 0.5
+    ) -> Optional[float]:
+        """
+        Poll T212 order-endpoint voor werkelijke fill-prijs (USD).
+
+        T212 market orders worden doorgaans binnen 1–2s uitgevoerd.
+        Geeft None terug als de order niet gevuld is binnen de timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data = self._get(f"/equity/orders/{order_id}")
+                status = data.get("status", "")
+                if status == "FILLED":
+                    # averagePrice is in instrument currency (USD voor US stocks)
+                    avg = data.get("averagePrice") or data.get("fillPrice")
+                    if avg:
+                        price = float(avg)
+                        logging.info(
+                            "T212 fill-prijs order %s: $%.4f", order_id, price
+                        )
+                        return price
+                    logging.debug(
+                        "T212 order %s FILLED maar geen averagePrice in response: %s",
+                        order_id, list(data.keys()),
+                    )
+                    return None
+                if status in ("CANCELLED", "REJECTED"):
+                    logging.warning(
+                        "T212 order %s status=%s — geen fill-prijs.", order_id, status
+                    )
+                    return None
+            except Exception as exc:
+                logging.debug("T212 order-poll %s: %s", order_id, exc)
+            time.sleep(poll_interval)
+        logging.debug(
+            "T212 order %s niet gevuld binnen %.0fs — bar-prijs als fallback.",
+            order_id, timeout,
+        )
+        return None
+
     def close_all_positions(self) -> None:
         """Sluit alle open T212-posities via market sell-orders."""
         try:

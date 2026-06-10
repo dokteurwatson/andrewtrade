@@ -1048,14 +1048,24 @@ class Trader:
         )
         self._sync_cash_from_broker(state, "buy")
 
-    def _do_sell(self, pos: Position) -> None:
-        """Voer sell-order uit. Gooit exception bij fout."""
-        self.client.sell_market(pos.ticker, pos.shares)
+    def _do_sell(self, pos: Position) -> Optional[float]:
+        """Voer sell-order uit en geef werkelijke fill-prijs terug (of None als onbekend)."""
+        order_id = self.client.sell_market(pos.ticker, pos.shares)
+        if hasattr(self.client, "get_order_fill_price"):
+            return self.client.get_order_fill_price(order_id)
+        return None
 
     def _record_close(
         self, state: DayState, pos: Position, exit_price: float, reason: str
     ) -> None:
         pnl = (exit_price - pos.entry_price) * pos.shares
+
+        fee = 0.0
+        fee_pct = self.settings.t212_fx_fee_pct
+        if self.settings.effective_broker() == "t212" and fee_pct > 0:
+            fee = (pos.entry_price + exit_price) * pos.shares * (fee_pct / 100.0)
+            pnl -= fee
+
         trade = ClosedTrade(
             ticker=pos.ticker,
             shares=pos.shares,
@@ -1069,16 +1079,17 @@ class Trader:
         self.store.close_position(state, trade)
 
         emoji = "WIN" if pnl >= 0 else "STOP"
+        fee_note = f" (incl. ${fee:.2f} FX-fee)" if fee > 0 else ""
         msg = (
             f"{emoji} {pos.ticker} | {pos.shares}x @ ${exit_price:.2f} | "
-            f"PnL: ${pnl:+.2f} | {reason}"
+            f"PnL: ${pnl:+.2f}{fee_note} | {reason}"
         )
         logging.info(msg)
         self.notifier.send(msg)
 
     def _exit(self, state: DayState, pos: Position, exit_price: float, reason: str) -> None:
         try:
-            self._do_sell(pos)
+            fill_price = self._do_sell(pos)
         except Exception as exc:
             if _is_position_gone_error(exc):
                 logging.warning(
@@ -1096,7 +1107,14 @@ class Trader:
             self.notifier.send(f"SELL MISLUKT {pos.ticker}: {detail}")
             raise
 
-        self._record_close(state, pos, exit_price, reason)
+        actual_price = fill_price if fill_price else exit_price
+        if fill_price and abs(fill_price - exit_price) > 0.001:
+            logging.info(
+                "SLIPPAGE %s: geschat $%.4f → fill $%.4f (%.2f%%)",
+                pos.ticker, exit_price, fill_price,
+                (fill_price - exit_price) / exit_price * 100,
+            )
+        self._record_close(state, pos, actual_price, reason)
         self._sync_cash_from_broker(state, "sell")
 
     def _eod_exit(self) -> None:
@@ -1118,8 +1136,8 @@ class Trader:
             for attempt in range(1, 4):
                 try:
                     with self._lock:
-                        self._do_sell(pos)
-                        self._record_close(state, pos, price, "EOD")
+                        fill_price = self._do_sell(pos)
+                        self._record_close(state, pos, fill_price or price, "EOD")
                     break
                 except Exception as exc:
                     if _is_position_gone_error(exc):
