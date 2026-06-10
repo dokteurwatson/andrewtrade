@@ -45,7 +45,7 @@ _BAR_HEALTH_INTERVAL_SEC = 120
 _STALE_GRACE_MIN_SEC = 180  # eerste stale-waarschuwing (niet 10 min wachten)
 
 # Order queue item types
-_OrderAction = Tuple[str, ...]  # ("ENTER", setup) | ("EXIT", pos, exit_price, reason)
+_OrderAction = Tuple[str, ...]  # ("ENTER", setup) | ("EXIT", pos, exit_price, reason, is_stop)
 
 
 def _build_broker_client(settings: Settings):
@@ -324,7 +324,8 @@ class Trader:
             if kind == "ENTER":
                 self._enter(state, args[0])  # type: ignore[arg-type]
             elif kind == "EXIT":
-                self._exit(state, args[0], args[1], args[2])  # type: ignore[arg-type]
+                is_stop = bool(args[3]) if len(args) > 3 else False
+                self._exit(state, args[0], args[1], args[2], is_stop_exit=is_stop)  # type: ignore[arg-type]
 
     def _run_loop_inner(self) -> None:
         setups = self._state.get_setups() if self._state else []
@@ -718,7 +719,7 @@ class Trader:
                     else:
                         reason = "STOP"   # originele hold geraakt
                     logging.info("%s %s | low=%.4f stop=%.4f", reason, ticker, low, pos.stop_price)
-                    self._order_queue.put(("EXIT", pos, pos.stop_price, reason))
+                    self._order_queue.put(("EXIT", pos, pos.stop_price, reason, True))
                 elif (
                     pos.target_price > pos.entry_price
                     and high >= pos.target_price
@@ -741,7 +742,7 @@ class Trader:
                         if high >= t2_target:
                             logging.info("T2 %s | high=%.4f (zelfde bar)", ticker, high)
                             pos = state.get_positions()[ticker]
-                            self._order_queue.put(("EXIT", pos, t2_target, "T2"))
+                            self._order_queue.put(("EXIT", pos, t2_target, "T2", False))
                     else:
                         runner_t2 = (
                             pos.t2_price > pos.entry_price
@@ -750,7 +751,7 @@ class Trader:
                         )
                         reason = "T2" if runner_t2 else "T1"
                         logging.info("%s %s | high=%.4f", reason, ticker, high)
-                        self._order_queue.put(("EXIT", pos, pos.target_price, reason))
+                        self._order_queue.put(("EXIT", pos, pos.target_price, reason, False))
                 return
 
             if not is_new_bar:
@@ -1051,9 +1052,22 @@ class Trader:
         )
         self._sync_cash_from_broker(state, "buy")
 
-    def _do_sell(self, pos: Position) -> Optional[float]:
-        """Voer sell-order uit en geef werkelijke fill-prijs terug (of None als onbekend)."""
-        order_id = self.client.sell_market(pos.ticker, pos.shares)
+    def _do_sell(self, pos: Position, limit_price: Optional[float] = None) -> Optional[float]:
+        """
+        Voer sell-order uit en geef werkelijke fill-prijs terug (of None als onbekend).
+
+        Als limit_price opgegeven is én STOP_SELL_LIMIT=true, wordt een limit-sell
+        geplaatst op limit_price (vult alleen als marktprijs >= limit_price).
+        """
+        use_limit = (
+            limit_price is not None
+            and self.settings.stop_sell_limit
+            and hasattr(self.client, "sell_limit")
+        )
+        if use_limit:
+            order_id = self.client.sell_limit(pos.ticker, pos.shares, limit_price)
+        else:
+            order_id = self.client.sell_market(pos.ticker, pos.shares)
         if hasattr(self.client, "get_order_fill_price"):
             return self.client.get_order_fill_price(order_id)
         return None
@@ -1090,9 +1104,18 @@ class Trader:
         logging.info(msg)
         self.notifier.send(msg)
 
-    def _exit(self, state: DayState, pos: Position, exit_price: float, reason: str) -> None:
+    def _exit(
+        self,
+        state: DayState,
+        pos: Position,
+        exit_price: float,
+        reason: str,
+        is_stop_exit: bool = False,
+    ) -> None:
+        # Bij stop/trail exits: geef stop_price mee zodat _do_sell een limit-sell kan plaatsen
+        limit_hint = pos.stop_price if is_stop_exit else None
         try:
-            fill_price = self._do_sell(pos)
+            fill_price = self._do_sell(pos, limit_price=limit_hint)
         except Exception as exc:
             if _is_position_gone_error(exc):
                 logging.warning(
