@@ -51,9 +51,9 @@
       </td>
       <td>{{ d.trade_count }}</td>
       <td class="{% if d.day_pnl > 0 %}green{% elif d.day_pnl < 0 %}red{% endif %}">
-        ${{ "%+.2f"|format(d.day_pnl) }}
+        {{ account_currency_symbol }}{{ "%+.2f"|format(d.day_pnl) }}
       </td>
-      <td>${{ "%.2f"|format(d.cash) }}</td>
+      <td>{{ account_currency_symbol }}{{ "%.2f"|format(d.cash) }}</td>
       <td>{{ d.open_positions }}</td>
     </tr>
     {% endfor %}

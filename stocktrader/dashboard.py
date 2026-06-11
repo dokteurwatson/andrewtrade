@@ -169,6 +169,17 @@ def _broker_label() -> str:
     return "PAPER"
 
 
+def _account_currency_ctx() -> dict:
+    account_currency = "USD"
+    if settings.effective_broker() == "t212" and isinstance(trader.client, T212Client):
+        account_currency = trader.client.get_account_currency_cached(default="EUR")
+    return {
+        "account_currency": account_currency,
+        "account_currency_symbol": currency_symbol(account_currency),
+        "stock_currency_symbol": "$",
+    }
+
+
 def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None = None) -> dict:
     setups = state.get_setups()
     trades = state.get_closed_trades()
@@ -207,10 +218,7 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
     })
 
     is_paper_broker = settings.effective_broker() == "paper"
-    account_currency = "USD"
-    if settings.effective_broker() == "t212" and isinstance(trader.client, T212Client):
-        account_currency = trader.client.get_account_currency_cached(default="EUR")
-    account_currency_symbol = currency_symbol(account_currency)
+    currency_ctx = _account_currency_ctx()
 
     return dict(
         state=state,
@@ -234,13 +242,11 @@ def _render_ctx(state: DayState, *, error: str = "", warn_blocked: list | None =
         engine_live=engine_live,
         bot_status=bot_status,
         bot_hint=bot_hint,
-        account_currency=account_currency,
-        account_currency_symbol=account_currency_symbol,
-        stock_currency_symbol="$",
         trailing_enabled=settings.trailing_stop_enabled,
         trail_mode=settings.trail_mode,
         trail_activation_pct=settings.trail_activation_pct,
         trail_distance_pct=settings.trail_distance_pct,
+        **currency_ctx,
     )
 
 
@@ -532,6 +538,7 @@ def history():
         days=days,
         today=today().isoformat(),
         state_dir_hint=settings.state_dir,
+        **_account_currency_ctx(),
     )
 
 
@@ -551,6 +558,7 @@ def history_day(date_str: str):
             cash=0.0,
             missing=True,
             today=today().isoformat(),
+            **_account_currency_ctx(),
         )
     trades = state.get_closed_trades()
     day_pnl = sum(t.pnl for t in trades)
@@ -562,6 +570,7 @@ def history_day(date_str: str):
         cash=state.cash,
         missing=False,
         today=today().isoformat(),
+        **_account_currency_ctx(),
     )
 
 

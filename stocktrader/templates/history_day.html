@@ -49,7 +49,7 @@
   <div class="stat">
     <div class="stat-label">Dag PnL</div>
     <div class="stat-value {% if day_pnl > 0 %}green{% elif day_pnl < 0 %}red{% endif %}">
-      ${{ "%+.2f"|format(day_pnl) }}
+      {{ account_currency_symbol }}{{ "%+.2f"|format(day_pnl) }}
     </div>
   </div>
   <div class="stat">
@@ -58,7 +58,7 @@
   </div>
   <div class="stat">
     <div class="stat-label">Cash (opgeslagen)</div>
-    <div class="stat-value green">${{ "%.2f"|format(cash) }}</div>
+    <div class="stat-value green">{{ account_currency_symbol }}{{ "%.2f"|format(cash) }}</div>
   </div>
 </div>
 
@@ -66,16 +66,16 @@
   <h2>Trades</h2>
   {% if trades %}
   <table>
-    <tr><th>Ticker</th><th>Shares</th><th>Entry $</th><th>Exit $</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reden</th></tr>
+    <tr><th>Ticker</th><th>Shares</th><th>Entry {{ stock_currency_symbol }}</th><th>Exit {{ stock_currency_symbol }}</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reden</th></tr>
     {% for t in trades %}
     <tr>
       <td><strong>{{ t.ticker }}</strong></td>
       <td>{{ t.shares }}x</td>
-      <td>${{ "%.4f"|format(t.entry_price) }}</td>
-      <td>${{ "%.4f"|format(t.exit_price) }}</td>
+      <td>{{ stock_currency_symbol }}{{ "%.4f"|format(t.entry_price) }}</td>
+      <td>{{ stock_currency_symbol }}{{ "%.4f"|format(t.exit_price) }}</td>
       <td>{{ t.entry_time }}</td>
       <td>{{ t.exit_time }}</td>
-      <td class="{% if t.pnl >= 0 %}green{% else %}red{% endif %}">${{ "%+.2f"|format(t.pnl) }}</td>
+      <td class="{% if t.pnl >= 0 %}green{% else %}red{% endif %}">{{ account_currency_symbol }}{{ "%+.2f"|format(t.pnl) }}</td>
       <td>
         {% if t.reason == "T1" %}
           <span class="badge badge-win">WIN</span>
