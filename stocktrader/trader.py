@@ -30,7 +30,7 @@ from .market_data import ET, in_regular_session, orb_avg_volume
 from .market_snapshot import build_quote_row, quote_status
 from .notifier import Notifier
 from .parser import Setup
-from .pnl import compute_trade_pnl
+from .pnl import compute_entry_eur_cost, compute_trade_pnl
 from .state import ClosedTrade, DayState, Position, StateStore
 from .trailing_stop import compute_trailing_stop, trailing_allowed
 from .t212_client import T212Client, currency_symbol
@@ -882,6 +882,16 @@ class Trader:
                 setup.ticker, entry_price, setup.t1,
             )
             return
+        entry_eur_cost = 0.0
+        if self.settings.effective_broker() == "t212" and self._account_currency() != "USD":
+            entry_eur_cost = compute_entry_eur_cost(
+                entry_price=entry_price,
+                shares=shares,
+                fee_pct=self.settings.t212_fx_fee_pct,
+                account_currency=self._account_currency(),
+                fx_eur_usd=self.settings.fx_eur_usd,
+                fx_gbp_usd=self.settings.fx_gbp_usd,
+            )
         pos = Position(
             ticker=setup.ticker,
             shares=shares,
@@ -892,11 +902,7 @@ class Trader:
             order_id=order_id,
             t2_price=setup.t2,
             high_water=entry_price,
-            entry_fx_fee_eur=(
-                self.settings.t212_fx_fee_fixed_eur
-                if self.settings.effective_broker() == "t212"
-                else 0.0
-            ),
+            entry_eur_cost=entry_eur_cost,
         )
         self.store.open_position(state, pos)
         max_loss = (entry_price - setup.hold) * shares
@@ -1084,8 +1090,7 @@ class Trader:
             account_currency=self._account_currency(),
             fx_eur_usd=self.settings.fx_eur_usd,
             fx_gbp_usd=self.settings.fx_gbp_usd,
-            fx_fee_fixed=self.settings.t212_fx_fee_fixed_eur,
-            entry_fx_fee=pos.entry_fx_fee_eur,
+            entry_eur_cost=pos.entry_eur_cost,
         )
         sym = currency_symbol(self._account_currency())
 
