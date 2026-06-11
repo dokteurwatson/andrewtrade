@@ -30,8 +30,10 @@ from .market_data import ET, in_regular_session, orb_avg_volume
 from .market_snapshot import build_quote_row, quote_status
 from .notifier import Notifier
 from .parser import Setup
+from .pnl import compute_trade_pnl
 from .state import ClosedTrade, DayState, Position, StateStore
 from .trailing_stop import compute_trailing_stop, trailing_allowed
+from .t212_client import T212Client, currency_symbol
 
 ET = zoneinfo.ZoneInfo("America/New_York")
 MARKET_OPEN_H  = 9
@@ -1021,7 +1023,11 @@ class Trader:
             self.notifier.send(f"ORDER MISLUKT {setup.ticker} x{shares}: {detail}")
             return
 
-        fill_price = self.client.get_latest_price(setup.ticker) or size_price
+        fill_price = None
+        if hasattr(self.client, "get_order_fill_price"):
+            fill_price = self.client.get_order_fill_price(order_id)
+        if not fill_price:
+            fill_price = self.client.get_latest_price(setup.ticker) or size_price
         fill_target = profit_target_for_entry(setup, fill_price)
         if fill_target is None or fill_target <= fill_price:
             logging.error(
@@ -1055,16 +1061,26 @@ class Trader:
             return self.client.get_order_fill_price(order_id)
         return None
 
+    def _account_currency(self) -> str:
+        if isinstance(self.client, T212Client):
+            return self.client.get_account_currency_cached(default="EUR")
+        return "USD"
+
     def _record_close(
         self, state: DayState, pos: Position, exit_price: float, reason: str
     ) -> None:
-        pnl = (exit_price - pos.entry_price) * pos.shares
-
-        fee = 0.0
-        fee_pct = self.settings.t212_fx_fee_pct
-        if self.settings.effective_broker() == "t212" and fee_pct > 0:
-            fee = (pos.entry_price + exit_price) * pos.shares * (fee_pct / 100.0)
-            pnl -= fee
+        broker = self.settings.effective_broker()
+        pnl, fee = compute_trade_pnl(
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            shares=pos.shares,
+            broker=broker,
+            fee_pct=self.settings.t212_fx_fee_pct,
+            account_currency=self._account_currency(),
+            fx_eur_usd=self.settings.fx_eur_usd,
+            fx_gbp_usd=self.settings.fx_gbp_usd,
+        )
+        sym = currency_symbol(self._account_currency())
 
         trade = ClosedTrade(
             ticker=pos.ticker,
@@ -1074,15 +1090,15 @@ class Trader:
             entry_time=pos.entry_time,
             exit_time=datetime.now(ET).strftime("%H:%M"),
             reason=reason,
-            pnl=round(pnl, 2),
+            pnl=pnl,
         )
         self.store.close_position(state, trade)
 
         emoji = "WIN" if pnl >= 0 else "STOP"
-        fee_note = f" (incl. ${fee:.2f} FX-fee)" if fee > 0 else ""
+        fee_note = f" (incl. {sym}{fee:.2f} FX-fee)" if fee > 0 else ""
         msg = (
             f"{emoji} {pos.ticker} | {pos.shares}x @ ${exit_price:.2f} | "
-            f"PnL: ${pnl:+.2f}{fee_note} | {reason}"
+            f"PnL: {sym}{pnl:+.2f}{fee_note} | {reason}"
         )
         logging.info(msg)
         self.notifier.send(msg)

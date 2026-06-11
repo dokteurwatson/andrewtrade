@@ -391,7 +391,22 @@ def close_position_manual(ticker: str):
 
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _ZI
-    pnl = (exit_price - float(pos_dict["entry_price"])) * int(pos_dict["shares"])
+    from .pnl import compute_trade_pnl
+
+    account_currency = "USD"
+    if settings.effective_broker() == "t212" and isinstance(trader.client, T212Client):
+        account_currency = trader.client.get_account_currency_cached(default="EUR")
+
+    pnl, _fee = compute_trade_pnl(
+        entry_price=float(pos_dict["entry_price"]),
+        exit_price=exit_price,
+        shares=int(pos_dict["shares"]),
+        broker=settings.effective_broker(),
+        fee_pct=settings.t212_fx_fee_pct,
+        account_currency=account_currency,
+        fx_eur_usd=settings.fx_eur_usd,
+        fx_gbp_usd=settings.fx_gbp_usd,
+    )
     trade = ClosedTrade(
         ticker=ticker,
         shares=int(pos_dict["shares"]),

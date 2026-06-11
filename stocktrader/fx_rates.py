@@ -87,3 +87,25 @@ def get_rate_to_usd(
             logging.debug("FX %s fallback env: %.4f", pair, rate)
 
     return rate * (1.0 - max(0.0, buffer_pct))
+
+
+def convert_usd_to_account(
+    amount_usd: float,
+    currency: str,
+    *,
+    fallback_eur_usd: float,
+    fallback_gbp_usd: float,
+) -> float:
+    """USD → accountvaluta (geen sizing-buffer; voor PnL-weergave)."""
+    ccy = currency.upper()
+    if ccy == "USD":
+        return amount_usd
+    rate = get_rate_to_usd(
+        ccy,
+        fallback_eur_usd=fallback_eur_usd,
+        fallback_gbp_usd=fallback_gbp_usd,
+        buffer_pct=0.0,
+    )
+    if rate <= 0:
+        return amount_usd
+    return amount_usd / rate

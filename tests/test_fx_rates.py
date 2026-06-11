@@ -31,3 +31,12 @@ def test_get_rate_to_usd_eur_fallback(mock_fetch):
         "EUR", fallback_eur_usd=1.08, fallback_gbp_usd=1.27, buffer_pct=0.0,
     )
     assert rate == pytest.approx(1.08)
+
+
+def test_convert_usd_to_account_eur():
+    fx_rates._cache.clear()
+    with patch.object(fx_rates, "_fetch_live_rate", return_value=1.08):
+        eur = fx_rates.convert_usd_to_account(
+            5.40, "EUR", fallback_eur_usd=1.08, fallback_gbp_usd=1.27,
+        )
+    assert eur == pytest.approx(5.0)
