@@ -892,6 +892,11 @@ class Trader:
             order_id=order_id,
             t2_price=setup.t2,
             high_water=entry_price,
+            entry_fx_fee_eur=(
+                self.settings.t212_fx_fee_fixed_eur
+                if self.settings.effective_broker() == "t212"
+                else 0.0
+            ),
         )
         self.store.open_position(state, pos)
         max_loss = (entry_price - setup.hold) * shares
@@ -1079,6 +1084,8 @@ class Trader:
             account_currency=self._account_currency(),
             fx_eur_usd=self.settings.fx_eur_usd,
             fx_gbp_usd=self.settings.fx_gbp_usd,
+            fx_fee_fixed=self.settings.t212_fx_fee_fixed_eur,
+            entry_fx_fee=pos.entry_fx_fee_eur,
         )
         sym = currency_symbol(self._account_currency())
 

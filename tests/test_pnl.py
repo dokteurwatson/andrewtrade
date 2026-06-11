@@ -24,28 +24,23 @@ def test_compute_trade_pnl_usd_account():
     assert fee == pytest.approx(round(expected_fee, 2))
 
 
-def test_compute_trade_pnl_eur_account_converts():
+@patch.object(fx_rates, "_fetch_live_rate", return_value=1.08)
+def test_compute_trade_pnl_eur_includes_buy_and_sell_fx(mock_fetch):
     fx_rates._cache.clear()
-    with patch.object(fx_rates, "_fetch_live_rate", return_value=1.08):
-        pnl, fee = compute_trade_pnl(
-            entry_price=7.20,
-            exit_price=7.72,
-            shares=11,
-            broker="t212",
-            fee_pct=0.11,
-            account_currency="EUR",
-            fx_eur_usd=1.08,
-        )
-    usd_pnl, usd_fee = compute_trade_pnl(
+    pnl, fee = compute_trade_pnl(
         entry_price=7.20,
         exit_price=7.72,
         shares=11,
         broker="t212",
         fee_pct=0.11,
-        account_currency="USD",
+        account_currency="EUR",
+        fx_eur_usd=1.08,
+        fx_fee_fixed=0.12,
+        entry_fx_fee=0.12,
     )
-    assert pnl == pytest.approx(round(usd_pnl / 1.08, 2))
-    assert fee == pytest.approx(round(usd_fee / 1.08, 2))
+    gross_eur = (7.72 - 7.20) * 11 / 1.08
+    assert fee == pytest.approx(0.24)
+    assert pnl == pytest.approx(round(gross_eur - 0.24, 2))
 
 
 def test_compute_trade_pnl_paper_broker_usd():

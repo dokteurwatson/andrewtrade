@@ -412,6 +412,8 @@ def close_position_manual(ticker: str):
         account_currency=account_currency,
         fx_eur_usd=settings.fx_eur_usd,
         fx_gbp_usd=settings.fx_gbp_usd,
+        fx_fee_fixed=settings.t212_fx_fee_fixed_eur,
+        entry_fx_fee=float(pos_dict.get("entry_fx_fee_eur") or 0),
     )
     trade = ClosedTrade(
         ticker=ticker,

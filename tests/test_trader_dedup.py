@@ -34,6 +34,7 @@ def _settings(**kwargs) -> Settings:
         fx_gbp_usd=1.27,
         fx_buffer_pct=0.03,
         t212_fx_fee_pct=0.11,
+        t212_fx_fee_fixed_eur=0.12,
         max_order_usd=500.0,
         max_shares_per_order=0,
         volume_mult=2.0,

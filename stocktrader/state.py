@@ -40,6 +40,7 @@ class Position:
     t2_price:      float = 0.0
     high_water:    float = 0.0
     runner_active: bool  = False
+    entry_fx_fee_eur: float = 0.0  # T212 FX-fee betaald bij entry (accountvaluta)
 
 
 @dataclass
@@ -96,6 +97,7 @@ class DayState:
                 "t2_price": pos.get("t2_price", 0.0),
                 "high_water": pos.get("high_water", pos.get("entry_price", 0.0)),
                 "runner_active": pos.get("runner_active", False),
+                "entry_fx_fee_eur": pos.get("entry_fx_fee_eur", 0.0),
             })
             for ticker, pos in self.positions.items()
         }
